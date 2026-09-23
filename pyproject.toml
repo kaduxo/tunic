@@ -1,0 +1,16 @@
+[project]
+name = "tunic"
+version = "0.1.0"
+description = "Local-first agentic CLI for smaller models"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+tunic = "tunic.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["tunic*"]
