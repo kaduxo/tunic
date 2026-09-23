@@ -9,7 +9,7 @@ python3 -m venv .venv
 .venv/bin/pip install -e .
 ```
 
-Or put `bin/tunic` on `PATH`. It uses the `tunic` package next to it.
+Or put `bin/tunic` on `PATH`. `tonic` is the same command.
 
 ## Local model
 
@@ -29,7 +29,7 @@ tunic --base-url http://127.0.0.1:1234/v1 --provider lmstudio doctor
 
 ```bash
 cd /path/to/project
-tunic
+tonic
 ```
 
 The first screen names that directory. The session is bound to it. Relative paths stay inside it.

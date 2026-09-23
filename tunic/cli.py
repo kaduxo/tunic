@@ -149,6 +149,9 @@ def _models(settings) -> int:
 
 
 def _repl(settings) -> int:
+    print(f"tunic {__version__}", flush=True)
+    print(f"project: {settings.cwd}", flush=True)
+    print(f"provider: {settings.provider}", flush=True)
     print(format_banner(settings, model_text(settings)), flush=True)
     messages: list[dict] | None = None
     if settings.session:
