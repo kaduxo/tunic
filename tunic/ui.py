@@ -19,6 +19,8 @@ _LABELS = {
     "read_file": "read",
     "write_file": "write",
     "list_dir": "list",
+    "search": "search",
+    "edit_file": "edit",
 }
 
 
@@ -56,6 +58,8 @@ def _action(name: str, arguments: str) -> str:
     data = _parse(arguments)
     if name == "bash":
         target = data.get("command")
+    elif name == "search":
+        target = data.get("query")
     else:
         target = data.get("path")
     if not isinstance(target, str) or not target.strip():
@@ -192,6 +196,11 @@ def permission_question(name: str, arguments: dict | None = None) -> str:
         if isinstance(path, str) and path.strip():
             return f"Write {_one_line(path, 72)}? This changes the project.\nAllow it? [y/N] "
         return "Write a file? This changes the project.\nAllow it? [y/N] "
+    if name == "edit_file":
+        path = data.get("path")
+        if isinstance(path, str) and path.strip():
+            return f"Write a span in {_one_line(path, 72)}? This changes the project.\nAllow it? [y/N] "
+        return "Write a span in a file? This changes the project.\nAllow it? [y/N] "
     return f"Allow {name} before it runs? [y/N] "
 
 

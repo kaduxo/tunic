@@ -890,11 +890,16 @@ class HelpTests(unittest.TestCase):
 
         shell = permission_question("bash", {"command": "ls -la"})
         write = permission_question("write_file", {"path": "notes.txt"})
+        edit = permission_question("edit_file", {"path": "notes.txt", "start": "2"})
         self.assertIn("shell command", shell)
         self.assertIn("ls -la", shell)
         self.assertIn("Allow it?", shell)
         self.assertIn("notes.txt", write)
         self.assertIn("changes the project", write)
+        self.assertIn("notes.txt", edit)
+        self.assertIn("span", edit)
+        self.assertIn("changes the project", edit)
+        self.assertIn("Allow it?", edit)
 
     def test_no_color_turns_the_working_line_off(self):
         from tunic.cli import _working_line
@@ -1234,6 +1239,123 @@ class ScreenTests(unittest.TestCase):
         self.assertNotIn("\033[", text)
         self.assertNotIn("┌", text)
         self.assertNotIn("└", text)
+
+
+class SpanSearchTests(unittest.TestCase):
+    def test_search_returns_path_and_line_number(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nested = root / "pkg"
+            nested.mkdir()
+            (nested / "notes.txt").write_text("first\nknown-string\nthird\n", encoding="utf-8")
+            (root / "other.txt").write_text("nothing here\n", encoding="utf-8")
+            git = root / ".git"
+            git.mkdir()
+            (git / "hidden.txt").write_text("known-string\n", encoding="utf-8")
+            settings = _settings(provider="lmstudio", plan=True, home=root, cwd=tmp)
+            found = run_tool("search", {"query": "known-string", "path": "."}, settings)
+        self.assertNotIn("permission denied", found)
+        self.assertIn("pkg/notes.txt:2:", found)
+        self.assertIn("known-string", found)
+        self.assertNotIn("other.txt", found)
+        self.assertNotIn(".git", found)
+
+    def test_edit_changes_one_line_and_leaves_the_rest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "notes.txt"
+            path.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+            settings = _settings(provider="lmstudio", yes=True, home=Path(tmp), cwd=tmp)
+            edited = run_tool(
+                "edit_file",
+                {"path": "notes.txt", "start": "2", "end": "2", "content": "BETA"},
+                settings,
+            )
+            text = path.read_text(encoding="utf-8")
+        self.assertNotIn("permission denied", edited)
+        self.assertNotIn("tool error", edited)
+        self.assertEqual(text, "alpha\nBETA\ngamma\n")
+        lines = text.splitlines()
+        self.assertEqual(lines[0], "alpha")
+        self.assertEqual(lines[2], "gamma")
+        self.assertNotEqual(text, "BETA")
+
+    def test_span_write_asks_unless_yes_and_plan_refuses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "notes.txt"
+            original = "alpha\nbeta\ngamma\n"
+            path.write_text(original, encoding="utf-8")
+            args = {"path": "notes.txt", "start": "2", "end": "2", "content": "BETA"}
+            asked = []
+
+            def ask(name, arguments):
+                asked.append((name, path.read_text(encoding="utf-8")))
+                return False
+
+            denied_settings = _settings(provider="lmstudio", home=Path(tmp), cwd=tmp)
+            denied = run_tool("edit_file", args, denied_settings, ask=ask)
+            self.assertEqual(asked, [("edit_file", original)])
+            self.assertIn("permission denied", denied)
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
+
+            def refuse(name, arguments):
+                raise AssertionError("plan mode asked")
+
+            plan = _settings(provider="lmstudio", plan=True, yes=True, home=Path(tmp), cwd=tmp)
+            refused = run_tool("edit_file", args, plan, ask=refuse)
+            self.assertIn("permission denied", refused)
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
+
+            def boom(name, arguments):
+                raise AssertionError("yes should not ask")
+
+            allowed = _settings(provider="lmstudio", yes=True, home=Path(tmp), cwd=tmp)
+            edited = run_tool("edit_file", args, allowed, ask=boom)
+            self.assertNotIn("permission denied", edited)
+            self.assertEqual(path.read_text(encoding="utf-8"), "alpha\nBETA\ngamma\n")
+
+    def test_request_uses_default_max_tokens_not_1024(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            env = {"TUNIC_HOME": tmp, "HOME": tmp, "PATH": os.environ.get("PATH", "")}
+            with patch.dict(os.environ, env, clear=True):
+                settings = resolve_settings(provider="lmstudio", model="m", home=home, cwd=tmp)
+                payload = build_openai_payload(
+                    [{"role": "user", "content": "hi"}],
+                    builtin_tools(),
+                    settings,
+                )
+            self.assertGreaterEqual(settings.max_tokens, 4096)
+            self.assertNotEqual(settings.max_tokens, 1024)
+            self.assertEqual(payload["max_tokens"], settings.max_tokens)
+            self.assertGreaterEqual(payload["max_tokens"], 4096)
+            self.assertNotEqual(payload["max_tokens"], 1024)
+            self.assertIs(payload["stream"], False)
+            self.assertEqual(payload["tools"][0]["function"]["name"], "bash")
+            names = [tool["function"]["name"] for tool in payload["tools"]]
+            for name in ("bash", "read_file", "write_file", "list_dir", "search", "edit_file"):
+                self.assertIn(name, names)
+            with patch.dict(os.environ, env, clear=True):
+                short = resolve_settings(
+                    provider="lmstudio",
+                    model="m",
+                    home=home,
+                    cwd=tmp,
+                    max_tokens=128,
+                )
+            self.assertEqual(short.max_tokens, 128)
+
+    def test_original_four_tools_still_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _settings(provider="lmstudio", yes=True, home=Path(tmp), cwd=tmp)
+            wrote = run_tool("write_file", {"path": "sub/a.txt", "content": "hello"}, settings)
+            read = run_tool("read_file", {"path": "sub/a.txt"}, settings)
+            listed = run_tool("list_dir", {"path": "sub"}, settings)
+            ran = run_tool("bash", {"command": "printf tunic-ok"}, settings)
+        self.assertIn("wrote", wrote)
+        self.assertEqual(read, "hello")
+        self.assertIn("a.txt", listed)
+        self.assertIn("tunic-ok", ran)
+        self.assertIn("exit=0", ran)
 
 
 if __name__ == "__main__":

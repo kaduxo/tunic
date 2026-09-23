@@ -12,6 +12,9 @@ from urllib.parse import urlparse
 # Local default. Override with --base-url, TUNIC_BASE_URL, or config.json.
 LMSTUDIO_BASE_URL = "http://127.0.0.1:1234/v1"
 
+# A 1024-token reply cannot hold a real edit. This is the unset default only.
+DEFAULT_MAX_TOKENS = 4096
+
 LOCAL_PROVIDERS = frozenset({"lmstudio", "ollama", "vllm", "custom"})
 
 # kind, default base url, whether a cloud key is required, env var, pass-name env var
@@ -92,7 +95,7 @@ class Settings:
     model: str = ""
     base_url: str = LMSTUDIO_BASE_URL
     max_steps: int = 8
-    max_tokens: int = 1024
+    max_tokens: int = DEFAULT_MAX_TOKENS
     temperature: float = 0.2
     yes: bool = False
     plan: bool = False
@@ -293,7 +296,7 @@ def resolve_settings(
         raise ConfigError(f"cwd is not a directory: {work}")
 
     steps = max_steps if max_steps is not None else int(merged("max_steps") or 8)
-    tokens = max_tokens if max_tokens is not None else int(merged("max_tokens") or 1024)
+    tokens = max_tokens if max_tokens is not None else int(merged("max_tokens") or DEFAULT_MAX_TOKENS)
     temp = temperature if temperature is not None else float(merged("temperature") or 0.2)
     if steps < 1:
         raise ConfigError("--max-steps must be >= 1")

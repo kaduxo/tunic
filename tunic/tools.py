@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +11,11 @@ from tunic.config import Settings
 
 
 OUTPUT_CAP = 8000
+_READ_ONLY = frozenset({"read_file", "list_dir", "search"})
+_SKIP_DIRS = frozenset({".git", "__pycache__", ".venv", "node_modules", ".hg"})
+_MAX_MATCHES = 40
+_MAX_FILES = 2000
+_MAX_FILE_BYTES = 1_000_000
 
 
 @dataclass(frozen=True)
@@ -86,7 +92,7 @@ def builtin_tools() -> list[Tool]:
         ),
         Tool(
             name="write_file",
-            description="Write a text file, creating parent directories. Relative paths and ~ are allowed.",
+            description="Write a whole text file, creating parent directories. Relative paths and ~ are allowed.",
             schema=_object(
                 {
                     "path": {
@@ -102,6 +108,31 @@ def builtin_tools() -> list[Tool]:
             ),
         ),
         Tool(
+            name="edit_file",
+            description="Replace one line span. Other lines stay unchanged. Not a full-file rewrite.",
+            schema=_object(
+                {
+                    "path": {
+                        "type": "string",
+                        "description": "File path. Relative paths and ~ are allowed.",
+                    },
+                    "start": {
+                        "type": "string",
+                        "description": "First line of the span, 1-based, from search.",
+                    },
+                    "end": {
+                        "type": "string",
+                        "description": "Last line of the span, 1-based. Same as start to change one line.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Replacement text for that span only.",
+                    },
+                },
+                ["path", "start", "end", "content"],
+            ),
+        ),
+        Tool(
             name="list_dir",
             description="List entries in a directory. Relative paths and ~ are allowed.",
             schema=_object(
@@ -112,6 +143,23 @@ def builtin_tools() -> list[Tool]:
                     }
                 },
                 ["path"],
+            ),
+        ),
+        Tool(
+            name="search",
+            description="Search file contents for a literal string. Returns each match as path and line number.",
+            schema=_object(
+                {
+                    "query": {
+                        "type": "string",
+                        "description": "Literal string to find. Not a regular expression.",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "File or directory. Use . for the working directory.",
+                    },
+                },
+                ["query", "path"],
             ),
         ),
     ]
@@ -138,10 +186,10 @@ def _cap(text: str) -> str:
 
 
 def _permission(name: str, settings: Settings, ask, arguments: dict | None) -> str | None:
-    if name in ("read_file", "list_dir"):
+    if name in _READ_ONLY:
         return None
     if settings.plan:
-        return "permission denied: plan mode is read-only (bash and write_file are off)"
+        return "permission denied: plan mode is read-only (bash, write_file, and edit_file are off)"
     if settings.yes:
         return None
     if ask is not None and _granted(ask, name, arguments or {}):
@@ -171,8 +219,12 @@ def run_tool(name: str, arguments: dict | None, settings: Settings, ask=None) ->
             return _read(arguments, settings)
         if name == "write_file":
             return _write(arguments, settings)
+        if name == "edit_file":
+            return _edit(arguments, settings)
         if name == "list_dir":
             return _list(arguments, settings)
+        if name == "search":
+            return _search(arguments, settings)
     except ValueError as exc:
         return f"tool error: {exc}"
     except OSError as exc:
@@ -234,3 +286,157 @@ def _list(arguments: dict, settings: Settings) -> str:
         shown = names[:200]
         return "\n".join(shown) + f"\n[{len(names) - 200} more]"
     return "\n".join(names) if names else "(empty)"
+
+
+def _line_number(value, label: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be a line number")
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, float) and value.is_integer():
+        number = int(value)
+    elif isinstance(value, str) and value.strip().isdigit():
+        number = int(value.strip())
+    else:
+        raise ValueError(f"{label} must be a line number")
+    if number < 1:
+        raise ValueError(f"{label} must be >= 1")
+    return number
+
+
+def _split_keep(text: str) -> list[str]:
+    """Split on \\n and keep each line's ending, including a last line with none."""
+    if text == "":
+        return []
+    ends = text.endswith("\n")
+    parts = text.split("\n")
+    if ends:
+        parts = parts[:-1]
+    lines = [part + "\n" for part in parts[:-1]]
+    if parts:
+        lines.append(parts[-1] + ("\n" if ends else ""))
+    return lines
+
+
+def _replacement_lines(content: str) -> list[str]:
+    if content == "":
+        return []
+    if not content.endswith("\n"):
+        content += "\n"
+    return [part + "\n" for part in content.split("\n")[:-1]]
+
+
+def _edit(arguments: dict, settings: Settings) -> str:
+    path = resolve_user_path(str(arguments.get("path", "")), settings.cwd)
+    if not path.is_file():
+        return f"tool error: not a file: {path}"
+    content = arguments.get("content")
+    if not isinstance(content, str):
+        return "tool error: edit_file requires content as a string"
+    try:
+        start = _line_number(arguments.get("start"), "start")
+        end_raw = arguments.get("end", None)
+        end = start if end_raw in (None, "") else _line_number(end_raw, "end")
+    except ValueError as exc:
+        return f"tool error: {exc}"
+    if end < start:
+        return "tool error: end is before start"
+    data = path.read_bytes()
+    if b"\x00" in data[:8192]:
+        return f"tool error: {path} looks binary"
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return f"tool error: {path} is not utf-8 text"
+    lines = _split_keep(text)
+    if start > len(lines) or end > len(lines):
+        return f"tool error: line {start}-{end} is outside {path} ({len(lines)} lines)"
+    # Splice the span. Lines outside it are copied, not rewritten by the model.
+    new_lines = lines[: start - 1] + _replacement_lines(content) + lines[end:]
+    path.write_text("".join(new_lines), encoding="utf-8")
+    return f"edited {path} lines {start}-{end}"
+
+
+def _display_path(path: Path, cwd: Path) -> str:
+    try:
+        rel = path.resolve().relative_to(cwd.resolve())
+    except ValueError:
+        return path.as_posix()
+    text = rel.as_posix()
+    return text or path.name
+
+
+def _search_file(path: Path, query: str, cwd: Path, limit: int) -> tuple[list[str], bool]:
+    try:
+        if not path.is_file():
+            return [], False
+        if path.stat().st_size > _MAX_FILE_BYTES:
+            return [], False
+        data = path.read_bytes()
+    except OSError:
+        return [], False
+    if b"\x00" in data[:8192]:
+        return [], False
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return [], False
+    shown: list[str] = []
+    display = _display_path(path, cwd)
+    for number, line in enumerate(text.splitlines(), start=1):
+        if query not in line:
+            continue
+        preview = line if len(line) <= 200 else line[:200] + "…"
+        if len(shown) >= limit:
+            return shown, True
+        shown.append(f"{display}:{number}:{preview}")
+    return shown, False
+
+
+def _iter_files(root: Path):
+    if root.is_file():
+        yield root
+        return
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = sorted(name for name in dirnames if name not in _SKIP_DIRS)
+        for name in sorted(filenames):
+            yield Path(dirpath) / name
+
+
+def _search(arguments: dict, settings: Settings) -> str:
+    query = arguments.get("query")
+    if not isinstance(query, str) or query == "":
+        return "tool error: search requires a query string"
+    if "\n" in query or "\r" in query:
+        return "tool error: search query must be a single line"
+    raw = arguments.get("path")
+    if raw is None or raw == "":
+        raw = "."
+    if not isinstance(raw, str):
+        return "tool error: search path must be a string"
+    root = resolve_user_path(raw, settings.cwd)
+    if not root.exists():
+        return f"tool error: not found: {root}"
+    if root.is_file() and root.stat().st_size > _MAX_FILE_BYTES:
+        return f"tool error: {root} is too large to search"
+    if not root.is_file() and not root.is_dir():
+        return f"tool error: not a file or directory: {root}"
+    matches: list[str] = []
+    truncated = False
+    seen = 0
+    for file_path in _iter_files(root):
+        seen += 1
+        if seen > _MAX_FILES:
+            truncated = True
+            break
+        found, hit = _search_file(file_path, query, settings.cwd, _MAX_MATCHES - len(matches))
+        matches.extend(found)
+        if hit or len(matches) >= _MAX_MATCHES:
+            truncated = True
+            break
+    if not matches:
+        return "no matches"
+    text = "\n".join(matches)
+    if truncated:
+        text += "\n[more matches omitted]"
+    return _cap(text)

@@ -26,7 +26,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", help="Model id. LM Studio defaults to the already-loaded model")
     parser.add_argument("--base-url", help="API base URL")
     parser.add_argument("--profile", help="Profile name from ~/.tunic/config.json")
-    parser.add_argument("--yes", action="store_true", help="Allow bash and write_file without asking")
+    parser.add_argument("--yes", action="store_true", help="Allow bash, write_file, and edit_file without asking")
     parser.add_argument("--plan", action="store_true", help="Read-only plan turn")
     parser.add_argument("--cwd", help="Working directory for file and bash tools")
     parser.add_argument("--session", help="Resume or save a session name")

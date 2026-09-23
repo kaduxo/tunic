@@ -34,6 +34,8 @@ tonic
 
 The first screen puts the project, the connection, the model, and whether plan mode or write permission is on in one labeled box. The version is on that box, once. It is not printed again after a save. `/help` puts the slash commands in a labeled box. A turn puts the working line and each step in a labeled box; the answer comes after that box. A write or a shell command asks before it runs unless you pass `--yes`. `--no-color` turns color off and still prints the boxes.
 
+`search` returns each match as a path and a line number. `edit_file` replaces that span and leaves the other lines. It asks first, the same as a full-file write, unless `--yes`. Plan mode still refuses it.
+
 ```bash
 tunic -p "read README.md and say the first heading"
 tunic --yes -p "create notes.txt with the line ok"
