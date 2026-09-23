@@ -12,6 +12,7 @@ import urllib.request
 from contextlib import redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
+import re
 from pathlib import Path
 from unittest.mock import patch
 
@@ -24,7 +25,16 @@ from tunic.tools import builtin_tools, resolve_user_path, run_tool
 from tunic.ui import ActivityView
 
 
-ROOT = Path(__file__).resolve().parents[1]
+def _strip_color(text: str) -> str:
+    return re.sub(r"\033\[[0-9;]*m", "", text)
+
+
+def _labeled_box(text: str, label: str) -> str:
+    marker = f"─ {label} "
+    start = text.index(marker)
+    top = text.rfind("┌", 0, start)
+    bottom = text.index("└", start)
+    return text[top:bottom]
 
 
 def _settings(**kwargs):
@@ -815,6 +825,11 @@ class HelpTests(unittest.TestCase):
             self.assertIn(name, out)
             self.assertIn(meaning, out)
         self.assertNotIn("/exit  /plan", out)
+        inside = _labeled_box(out, "Commands")
+        self.assertIn("Commands", inside.splitlines()[0])
+        for name, meaning in SLASH_HELP:
+            self.assertIn(name, inside)
+            self.assertIn(meaning, inside)
 
     def test_flag_help_names_flags_and_subcommands(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -950,6 +965,74 @@ class ScreenTests(unittest.TestCase):
         self.assertIn("provider: lmstudio", colored_out)
         self.assertNotIn("\033[", plain_out)
         self.assertIn("plan: off", plain_out)
+        self.assertIn("┌", plain_out)
+        self.assertIn("└", plain_out)
+        self.assertIn("┌", colored_out)
+        self.assertEqual(_strip_color(colored_out), plain_out)
+
+    def test_start_fields_sit_in_one_labeled_box(self):
+        from tunic.cli import format_banner
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _settings(provider="lmstudio", home=Path(tmp), cwd=tmp)
+            text = format_banner(settings, "already-loaded")
+        self.assertEqual(text.count("tunic 0.1.0"), 1)
+        self.assertEqual(text.count("┌"), 1)
+        self.assertEqual(text.count("└"), 1)
+        inside = _labeled_box(text, "tunic 0.1.0")
+        self.assertIn("tunic 0.1.0", inside.splitlines()[0])
+        for line in (
+            f"project: {settings.cwd}",
+            "provider: lmstudio",
+            "model: already-loaded",
+            "plan: off",
+            "writes: ask before a write or a shell",
+        ):
+            self.assertIn(line, inside)
+        self.assertGreater(text.index("/help"), text.index("└"))
+        from tunic.ui import format_slash_help, paint_block
+
+        colored = paint_block(text, enabled=True)
+        self.assertNotIn("\033[", text)
+        self.assertEqual(_strip_color(colored), text)
+        help_text = format_slash_help()
+        self.assertEqual(help_text.count("┌"), 1)
+        self.assertIn("Commands", _labeled_box(help_text, "Commands").splitlines()[0])
+        self.assertEqual(_strip_color(paint_block(help_text, enabled=True)), help_text)
+        self.assertNotIn("\033[", help_text)
+
+    def test_turn_box_holds_the_work_and_not_the_answer(self):
+        from tunic.agent import TurnResult
+
+        def fetch(settings, timeout=15):
+            return [{"id": "already-loaded", "state": "loaded", "capabilities": ["tool_use"]}]
+
+        def fake_turn(prompt, settings, emit, ask=None, prior=None):
+            emit('tool-call id=1 name=read_file arguments={"path": "README.md"}')
+            emit("tool-result: read_file")
+            emit("# Title")
+            emit("assistant: the heading is Title")
+            return TurnResult(messages=[], assistant="the heading is Title")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            with patch("tunic.cli.run_turn", side_effect=fake_turn):
+                with patch("tunic.config._stdout_is_tty", return_value=True):
+                    code, colored, err = SessionTests()._run(["read it", "/exit"], home, home, fetch=fetch)
+                    plain_code, plain, plain_err = SessionTests()._run(
+                        ["read it", "/exit"], home, home, fetch=fetch, argv=["--no-color"]
+                    )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(plain_code, 0, plain_err)
+        self.assertNotIn("\033[", plain)
+        self.assertEqual(_strip_color(colored), plain)
+        work = _labeled_box(plain, "turn")
+        self.assertIn("working…", work)
+        self.assertIn("→ read README.md", work)
+        self.assertNotIn("the heading is Title", work)
+        self.assertLess(plain.index("└", plain.index("─ turn ")), plain.index("the heading is Title"))
+        self.assertIn("┌", plain)
+        self.assertIn("└", plain)
 
     def test_turn_shows_working_then_the_step_then_the_answer(self):
         from tunic.agent import TurnResult
@@ -1146,6 +1229,8 @@ class ScreenTests(unittest.TestCase):
         self.assertIn("stream: false", text)
         self.assertNotIn("working…", text)
         self.assertNotIn("\033[", text)
+        self.assertNotIn("┌", text)
+        self.assertNotIn("└", text)
 
 
 if __name__ == "__main__":

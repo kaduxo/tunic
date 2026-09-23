@@ -32,7 +32,7 @@ cd /path/to/project
 tonic
 ```
 
-The first screen names the project, the connection, the model, and whether plan mode or write permission is on. It is not printed again after a save. `/help` lists every slash command. Each step is one line: read, write, list, or run. The answer comes after the steps. A write or a shell command asks before it runs unless you pass `--yes`. `--no-color` turns color off.
+The first screen puts the project, the connection, the model, and whether plan mode or write permission is on in one labeled box. The version is on that box, once. It is not printed again after a save. `/help` puts the slash commands in a labeled box. A turn puts the working line and each step in a labeled box; the answer comes after that box. A write or a shell command asks before it runs unless you pass `--yes`. `--no-color` turns color off and still prints the boxes.
 
 ```bash
 tunic -p "read README.md and say the first heading"

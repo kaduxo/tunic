@@ -1,4 +1,7 @@
-"""Interactive screen. Headless output stays machine-readable."""
+"""Interactive screen. Labeled boxes group what is already shown.
+
+Headless output stays machine-readable.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +9,10 @@ import json
 import re
 
 _TOOL_CALL = re.compile(r"^tool-call id=\S+ name=(\S+) arguments=(.*)$", re.DOTALL)
+_ANSI = re.compile(r"\033\[[0-9;]*m")
+
+# Shared floor so a short screen still has a real box, not a sliver.
+SCREEN_WIDTH = 72
 
 _LABELS = {
     "bash": "run",
@@ -92,17 +99,18 @@ def paint(text: str, code: str, *, enabled: bool) -> str:
 
 
 def tone_for(line: str) -> str:
-    if line.startswith("tunic "):
+    if line.startswith(("┌", "└")):
+        return "1" if "tunic " in line else "2"
+    inner = line[1:].strip() if line.startswith("│") else line
+    if inner.startswith("tunic "):
         return "1"
-    if line.startswith("─"):
-        return "2"
-    if line.startswith(("writes: ask", "writes: off", "plan: on")):
+    if inner.startswith(("writes: ask", "writes: off", "plan: on")):
         return "33"
-    if line.startswith("writes: allowed"):
+    if inner.startswith("writes: allowed"):
         return "32"
-    if line.startswith(("project:", "provider:", "model:", "plan:", "writes:", "saved")):
+    if inner.startswith(("project:", "provider:", "model:", "plan:", "writes:", "saved")):
         return "36"
-    if line.startswith("/"):
+    if inner.startswith("/"):
         return "2"
     return ""
 
@@ -111,14 +119,61 @@ def paint_block(text: str, *, enabled: bool) -> str:
     return "\n".join(paint(line, tone_for(line), enabled=enabled) for line in text.splitlines())
 
 
+def _visible_len(text: str) -> int:
+    return len(_ANSI.sub("", text))
+
+
+def boxed(label: str, lines: list[str], *, min_width: int = SCREEN_WIDTH) -> str:
+    """One labeled box. The words inside stay contiguous, including with color off."""
+    width = max([_visible_len(line) for line in lines] + [len(label) + 2, min_width])
+    framed = [_box_top(label, width), *(_box_row(line, width) for line in lines), _box_bottom(width)]
+    return "\n".join(framed)
+
+
+def _box_top(label: str, width: int) -> str:
+    inner = width + 2
+    title = f" {label} "
+    right = inner - 1 - len(title)
+    return "┌─" + title + ("─" * right) + "┐"
+
+
+def _box_row(text: str, width: int) -> str:
+    visible = _visible_len(text)
+    if visible <= width:
+        return "│ " + text + (" " * (width - visible)) + " │"
+    return "│ " + text
+
+
+def _box_bottom(width: int) -> str:
+    return "└" + ("─" * (width + 2)) + "┘"
+
+
+class OpenBox:
+    """Labeled box printed as the lines arrive. A long line keeps its words."""
+
+    def __init__(self, label: str, width: int = SCREEN_WIDTH) -> None:
+        self.label = label
+        self.width = max(width, len(label) + 2)
+        self.is_open = False
+
+    def start(self) -> str:
+        self.is_open = True
+        return _box_top(self.label, self.width)
+
+    def row(self, text: str) -> str:
+        return _box_row(text, self.width)
+
+    def end(self) -> str:
+        self.is_open = False
+        return _box_bottom(self.width)
+
+
 def format_slash_help() -> str:
-    """Every interactive command, one meaning each."""
+    """Every interactive command, one meaning each, in one labeled box."""
     width = max(len(name) for name, _meaning in SLASH_HELP)
-    lines = ["Commands"]
-    for name, meaning in SLASH_HELP:
-        lines.append(f"  {name:<{width}}  {meaning}")
-    lines.append("A write or a shell command asks in plain language before it runs, unless --yes.")
-    return "\n".join(lines)
+    rows = [f"{name:<{width}}  {meaning}" for name, meaning in SLASH_HELP]
+    note = "A write or a shell command asks in plain language before it runs, unless --yes."
+    return boxed("Commands", rows) + "\n" + note
 
 
 def permission_question(name: str, arguments: dict | None = None) -> str:

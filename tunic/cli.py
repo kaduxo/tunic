@@ -12,7 +12,7 @@ from tunic.config import PROVIDERS, ConfigError, ensure_home, resolve_settings, 
 from tunic.keys import KeyMissing, key_status
 from tunic.providers import ProviderError, fetch_lmstudio_catalog
 from tunic.session import load_session, save_session
-from tunic.ui import ActivityView, format_slash_help, paint, paint_block, permission_question, write_label
+from tunic.ui import ActivityView, OpenBox, SCREEN_WIDTH, boxed, format_slash_help, paint, paint_block, permission_question, write_label
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -84,18 +84,41 @@ def _emit(settings, text: str) -> None:
     print(text, flush=True)
 
 
-def _show(view: ActivityView, text: str, settings=None) -> None:
+def _show(view: ActivityView, text: str, settings, frame: OpenBox) -> None:
+    if text.startswith("assistant: "):
+        _close_turn(settings, frame)
+        body = text[len("assistant: ") :]
+        if body:
+            print(flush=True)
+            print(body, flush=True)
+        return
     enabled = bool(settings is not None and not settings.no_color)
     for line in view.feed(text):
+        if line == "":
+            continue
         if line.startswith("→"):
             line = paint(line, "36", enabled=enabled)
         elif line.startswith("  "):
             line = paint(line, "2", enabled=enabled)
-        print(line, flush=True)
+        print(_paint_turn_row(settings, frame.row(line)), flush=True)
 
 
 def _working_line(settings) -> str:
     return paint("working…", "2", enabled=not settings.no_color)
+
+
+def _paint_turn_row(settings, row: str) -> str:
+    """Color only the borders. The words stay contiguous either way."""
+    if settings.no_color or not row.startswith("│"):
+        return row
+    if row.endswith("│"):
+        return paint("│", "2", enabled=True) + row[1:-1] + paint("│", "2", enabled=True)
+    return paint("│", "2", enabled=True) + row[1:]
+
+
+def _close_turn(settings, frame: OpenBox) -> None:
+    if frame.is_open:
+        print(paint(frame.end(), "2", enabled=not settings.no_color), flush=True)
 
 
 def _print_screen(settings, text: str) -> None:
@@ -192,7 +215,7 @@ def _repl(settings) -> int:
         if line in ("/exit", "/quit"):
             return 0
         if line == "/help":
-            print(format_slash_help())
+            _print_screen(settings, format_slash_help())
             continue
         if line in ("/settings", "/config"):
             _settings_mode(settings)
@@ -231,21 +254,27 @@ def _repl(settings) -> int:
             continue
         ask = _interactive_ask if sys.stdin.isatty() else None
         view = ActivityView()
-        print(_working_line(settings), flush=True)
+        frame = OpenBox("turn")
+        print(paint(frame.start(), "2", enabled=not settings.no_color), flush=True)
+        print(_paint_turn_row(settings, frame.row(_working_line(settings))), flush=True)
         try:
             result = run_turn(
                 line,
                 settings,
-                emit=lambda text, view=view: _show(view, text, settings),
+                emit=lambda text, view=view, frame=frame: _show(view, text, settings, frame),
                 ask=ask,
                 prior=messages,
             )
         except (KeyMissing, ConfigError) as exc:
+            _close_turn(settings, frame)
             print(f"tunic: {exc}", file=sys.stderr)
             continue
         except ProviderError as exc:
+            _close_turn(settings, frame)
             print(f"tunic: {exc}", file=sys.stderr)
             continue
+        finally:
+            _close_turn(settings, frame)
         messages = result.messages
         if settings.session:
             try:
@@ -265,20 +294,18 @@ def _interactive_ask(name: str, arguments: dict | None = None) -> bool:
 
 def format_banner(settings, model_line: str) -> str:
     hint = "/settings  choose a connection    /help  commands    /exit  leave"
-    rule = "─" * len(hint)
-    return "\n".join(
+    body = boxed(
+        f"tunic {__version__}",
         [
-            f"tunic {__version__}",
-            rule,
             f"project: {settings.cwd}",
             f"provider: {settings.provider}",
             f"model: {model_line}",
             f"plan: {'on' if settings.plan else 'off'}",
             f"writes: {write_label(settings)}",
-            rule,
-            hint,
-        ]
+        ],
+        min_width=max(SCREEN_WIDTH, len(hint)),
     )
+    return body + "\n" + hint
 
 
 def format_status(settings, model_line: str) -> str:
