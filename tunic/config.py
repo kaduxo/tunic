@@ -403,6 +403,9 @@ def save_choice(
     data["model"] = model_value
     # A typed URL is only for a local endpoint. Cloud providers keep their
     # official URL so a saved choice cannot retarget a cloud key.
+    # An omitted URL is that official default — the URL the settings prompt
+    # shows in brackets — not "keep the previous URL". A model-only save
+    # must pass the URL already in use.
     if provider in {"ollama", "vllm", "custom"} and base_url:
         data["base_url"] = _public_base_url(base_url)
     elif provider == "custom":

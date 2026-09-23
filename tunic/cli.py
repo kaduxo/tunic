@@ -504,12 +504,16 @@ def _save_connection(settings, provider: str) -> None:
 
 
 def _save_model(settings, model: str) -> None:
+    # Model-only. Keep the URL already in use. Omitting it makes custom
+    # refuse the save, and replaces a non-default ollama or vllm URL.
+    base_url = settings.base_url if settings.provider in {"ollama", "vllm", "custom"} else None
     _commit_choice(
         settings,
         provider=settings.provider,
         model=model,
         pass_name=settings.pass_name,
         auth=settings.auth,
+        base_url=base_url,
     )
 
 

@@ -570,6 +570,104 @@ class SessionTests(unittest.TestCase):
         self.assertNotIn("127.0.0.1:9", json.loads(text)["base_url"])
         self.assertEqual(json.loads(text)["base_url"], "https://api.openai.com/v1")
 
+    def test_model_command_keeps_the_current_base_url(self):
+        # The screen chooses a connection, then /model changes only the model.
+        # Omitting the URL used to refuse custom and retarget ollama/vllm.
+        fetch = lambda settings, timeout=15: [{"id": "already-loaded", "state": "loaded"}]
+        sequences = (
+            ("8", "http://127.0.0.1:9/v1", "local-test", "other-model", "custom"),
+            ("4", "http://127.0.0.1:11435/v1", "llama", "other", "ollama"),
+            ("5", "http://127.0.0.1:8001/v1", "m", "other", "vllm"),
+        )
+        for choice, url, first_model, next_model, provider in sequences:
+            with self.subTest(provider=provider, path="settings-then-model"):
+                with tempfile.TemporaryDirectory() as tmp:
+                    home = Path(tmp)
+                    code, out, err = self._run(
+                        [
+                            "/settings",
+                            choice,
+                            url,
+                            first_model,
+                            f"/model {next_model}",
+                            "/exit",
+                        ],
+                        home,
+                        home,
+                        fetch=fetch,
+                    )
+                    saved = json.loads((home / "config.json").read_text(encoding="utf-8"))
+                self.assertEqual(code, 0, err)
+                self.assertEqual(saved["provider"], provider)
+                self.assertEqual(saved["model"], next_model)
+                self.assertEqual(saved["base_url"], url)
+                self.assertIn(f"model: {next_model}", out)
+                self.assertNotIn("Nothing saved", out)
+                self.assertNotIn("needs a base URL", out)
+            with self.subTest(provider=provider, path="saved-then-model"):
+                with tempfile.TemporaryDirectory() as tmp:
+                    home = Path(tmp)
+                    save_choice(home, provider=provider, model=first_model, base_url=url)
+                    code, out, err = self._run([f"/model {next_model}", "/exit"], home, home)
+                    saved = json.loads((home / "config.json").read_text(encoding="utf-8"))
+                self.assertEqual(code, 0, err)
+                self.assertEqual(saved["model"], next_model)
+                self.assertEqual(saved["base_url"], url)
+                self.assertNotIn("Nothing saved", out)
+
+    def test_settings_enter_means_the_url_shown_in_brackets(self):
+        fetch = lambda settings, timeout=15: [{"id": "already-loaded", "state": "loaded"}]
+        cases = (
+            ("4", "ollama", "http://127.0.0.1:11434/v1", "http://127.0.0.1:11435/v1"),
+            ("5", "vllm", "http://127.0.0.1:8000/v1", "http://127.0.0.1:8001/v1"),
+        )
+        for choice, provider, shown, typed in cases:
+            with self.subTest(provider=provider):
+                with tempfile.TemporaryDirectory() as tmp:
+                    home = Path(tmp)
+                    save_choice(home, provider=provider, model="kept", base_url=typed)
+                    code, out, err = self._run(
+                        ["/settings", choice, "", "after-enter", "/exit"],
+                        home,
+                        home,
+                        fetch=fetch,
+                    )
+                    saved = json.loads((home / "config.json").read_text(encoding="utf-8"))
+                self.assertEqual(code, 0, err)
+                self.assertIn(f"base url [{shown}]:", out)
+                self.assertEqual(saved["provider"], provider)
+                self.assertEqual(saved["model"], "after-enter")
+                self.assertEqual(saved["base_url"], shown)
+                self.assertNotIn(typed, saved["base_url"])
+
+    def test_settings_typed_url_replaces_the_saved_one(self):
+        fetch = lambda settings, timeout=15: [{"id": "already-loaded", "state": "loaded"}]
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            save_choice(home, provider="ollama", model="llama", base_url="http://127.0.0.1:11435/v1")
+            code, out, err = self._run(
+                ["/settings", "4", "http://127.0.0.1:11436/v1", "replacement", "/exit"],
+                home,
+                home,
+                fetch=fetch,
+            )
+            saved = json.loads((home / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(saved["model"], "replacement")
+        self.assertEqual(saved["base_url"], "http://127.0.0.1:11436/v1")
+
+    def test_model_command_does_not_retarget_a_cloud_url(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            save_choice(home, provider="openai", model="gpt-test", base_url="http://127.0.0.1:9/v1")
+            code, out, err = self._run(["/model other-cloud", "/exit"], home, home)
+            saved = json.loads((home / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(saved["provider"], "openai")
+        self.assertEqual(saved["model"], "other-cloud")
+        self.assertEqual(saved["base_url"], "https://api.openai.com/v1")
+        self.assertNotIn("127.0.0.1:9", saved["base_url"])
+
     def test_config_alias_and_rejected_token_are_not_written(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
