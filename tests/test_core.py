@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 from tunic.agent import compact_messages, run_turn, system_prompt
 from tunic.cli import main
-from tunic.config import LMSTUDIO_BASE_URL, resolve_settings, save_choice
+from tunic.config import LMSTUDIO_BASE_URL, ConfigError, resolve_settings, save_choice
 from tunic.keys import KeyMissing, key_status, resolve_key
 from tunic.providers import Completion, ProviderError, ToolCall, build_anthropic_payload, build_openai_payload
 from tunic.tools import builtin_tools, resolve_user_path, run_tool
@@ -395,7 +395,7 @@ class CliTests(unittest.TestCase):
 
 
 class SessionTests(unittest.TestCase):
-    def _run(self, lines, home, cwd, fetch=None, extra_env=None):
+    def _run(self, lines, home, cwd, fetch=None, extra_env=None, argv=None):
         fed = iter(lines)
 
         def fake_input(prompt=""):
@@ -422,10 +422,10 @@ class SessionTests(unittest.TestCase):
                 with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", side_effect=fake_input):
                     with redirect_stdout(stdout), redirect_stderr(stderr):
                         if fetch is None:
-                            code = main([])
+                            code = main(list(argv or []))
                         else:
                             with patch("tunic.cli.fetch_lmstudio_catalog", side_effect=fetch):
-                                code = main([])
+                                code = main(list(argv or []))
         finally:
             os.chdir(old)
         return code, stdout.getvalue(), stderr.getvalue()
@@ -444,6 +444,9 @@ class SessionTests(unittest.TestCase):
         self.assertIn(f"project: {Path(tmp).resolve()}", out)
         self.assertIn("provider: lmstudio", out)
         self.assertIn("model: already-loaded", out)
+        self.assertIn("plan: off", out)
+        self.assertIn("writes: ask before a write or a shell", out)
+        self.assertEqual(out.count("tunic 0.1.0"), 1)
         self.assertIn("/settings", out)
         self.assertIn("tunic>", out)
         self.assertEqual(timeouts, [3])
@@ -698,6 +701,353 @@ class ActivityViewTests(unittest.TestCase):
         )
         view.feed("tool-result: bash")
         self.assertEqual(view.feed("exit=0\nstdout:\nok"), ["  exit=0 (+2 lines)"])
+
+
+class HelpTests(unittest.TestCase):
+    def test_interactive_help_names_every_slash_command(self):
+        from tunic.ui import SLASH_HELP
+
+        def fetch(settings, timeout=15):
+            return [{"id": "already-loaded", "state": "loaded", "capabilities": ["tool_use"]}]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out, err = SessionTests()._run(["/help", "/exit"], Path(tmp), Path(tmp), fetch=fetch)
+        self.assertEqual(code, 0, err)
+        for name, meaning in SLASH_HELP:
+            self.assertIn(name, out)
+            self.assertIn(meaning, out)
+        self.assertNotIn("/exit  /plan", out)
+
+    def test_flag_help_names_flags_and_subcommands(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"TUNIC_HOME": tmp}):
+                with redirect_stdout(io.StringIO()) as buf:
+                    with self.assertRaises(SystemExit) as caught:
+                        main(["--help"])
+        self.assertEqual(caught.exception.code, 0)
+        text = buf.getvalue()
+        for name in (
+            "doctor",
+            "models",
+            "--prompt",
+            "--provider",
+            "--model",
+            "--base-url",
+            "--profile",
+            "--yes",
+            "--plan",
+            "--cwd",
+            "--session",
+            "--allow-load",
+            "--no-color",
+            "--max-steps",
+            "--max-tokens",
+            "--temperature",
+            "--version",
+        ):
+            self.assertIn(name, text)
+
+    def test_settings_offers_every_connection(self):
+        def fetch(settings, timeout=15):
+            return [{"id": "already-loaded", "state": "loaded"}]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            with patch("urllib.request.urlopen", side_effect=AssertionError("network")):
+                code, out, err = SessionTests()._run(
+                    ["/settings", "6", "router-test", "", "/exit"],
+                    home,
+                    home,
+                    fetch=fetch,
+                )
+            saved = json.loads((home / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(code, 0, err)
+        for label in ("ollama", "vllm", "openrouter", "groq", "custom URL", "grok / xAI"):
+            self.assertIn(label, out)
+        self.assertEqual(saved["provider"], "openrouter")
+        self.assertEqual(saved["model"], "router-test")
+        self.assertEqual(saved["base_url"], "https://openrouter.ai/api/v1")
+        self.assertNotIn("auth", saved)
+        self.assertEqual(out.count("tunic 0.1.0"), 1)
+        self.assertIn("saved", out)
+        self.assertIn("provider: openrouter", out)
+
+    def test_permission_question_is_plain_language(self):
+        from tunic.ui import permission_question
+
+        shell = permission_question("bash", {"command": "ls -la"})
+        write = permission_question("write_file", {"path": "notes.txt"})
+        self.assertIn("shell command", shell)
+        self.assertIn("ls -la", shell)
+        self.assertIn("Allow it?", shell)
+        self.assertIn("notes.txt", write)
+        self.assertIn("changes the project", write)
+
+    def test_no_color_turns_the_working_line_off(self):
+        from tunic.cli import _working_line
+
+        with tempfile.TemporaryDirectory() as tmp:
+            plain = _settings(provider="lmstudio", home=Path(tmp), cwd=tmp)
+            colored = _settings(provider="lmstudio", home=Path(tmp), cwd=tmp)
+        plain.no_color = True
+        colored.no_color = False
+        self.assertEqual(_working_line(plain), "working…")
+        self.assertIn("working…", _working_line(colored))
+        self.assertNotEqual(_working_line(colored), "working…")
+
+
+class ScreenTests(unittest.TestCase):
+    def test_plan_mode_shows_writes_off_even_with_yes(self):
+        from tunic.cli import format_banner
+
+        def fetch(settings, timeout=15):
+            return [{"id": "already-loaded", "state": "loaded"}]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            settings = _settings(provider="lmstudio", plan=True, yes=True, home=home, cwd=tmp)
+            text = format_banner(settings, "already-loaded")
+            code, out, err = SessionTests()._run(
+                ["/exit"],
+                home,
+                home,
+                fetch=fetch,
+                argv=["--plan", "--yes"],
+            )
+        self.assertIn("plan: on", text)
+        self.assertIn("writes: off (plan mode)", text)
+        self.assertNotIn("allowed (--yes)", text)
+        self.assertEqual(code, 0, err)
+        self.assertIn("plan: on", out)
+        self.assertIn("writes: off (plan mode)", out)
+        self.assertEqual(out.count("tunic 0.1.0"), 1)
+
+    def test_color_stays_out_of_the_words_and_no_color_strips_it(self):
+        from tunic.cli import format_banner
+        from tunic.ui import paint_block
+
+        def fetch(settings, timeout=15):
+            return [{"id": "already-loaded", "state": "loaded"}]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            settings = _settings(provider="lmstudio", home=home, cwd=tmp)
+            banner = format_banner(settings, "already-loaded")
+            plain = paint_block(banner, enabled=False)
+            colored = paint_block(banner, enabled=True)
+            self.assertNotIn("\033[", plain)
+            self.assertIn("\033[", colored)
+            self.assertIn("provider: lmstudio", colored)
+            self.assertIn("writes: ask before a write or a shell", colored)
+            with patch("tunic.config._stdout_is_tty", return_value=True):
+                colored_code, colored_out, colored_err = SessionTests()._run(
+                    ["/exit"], home, home, fetch=fetch
+                )
+                plain_code, plain_out, plain_err = SessionTests()._run(
+                    ["/exit"], home, home, fetch=fetch, argv=["--no-color"]
+                )
+        self.assertEqual(colored_code, 0, colored_err)
+        self.assertEqual(plain_code, 0, plain_err)
+        self.assertIn("\033[", colored_out)
+        self.assertIn("provider: lmstudio", colored_out)
+        self.assertNotIn("\033[", plain_out)
+        self.assertIn("plan: off", plain_out)
+
+    def test_turn_shows_working_then_the_step_then_the_answer(self):
+        from tunic.agent import TurnResult
+
+        def fetch(settings, timeout=15):
+            return [{"id": "already-loaded", "state": "loaded", "capabilities": ["tool_use"]}]
+
+        def fake_turn(prompt, settings, emit, ask=None, prior=None):
+            emit('tool-call id=1 name=read_file arguments={"path": "README.md"}')
+            emit("tool-result: read_file")
+            emit("# Title")
+            emit("assistant: the heading is Title")
+            return TurnResult(messages=[], assistant="the heading is Title")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            with patch("tunic.cli.run_turn", side_effect=fake_turn):
+                code, out, err = SessionTests()._run(["read it", "/exit"], home, home, fetch=fetch)
+        self.assertEqual(code, 0, err)
+        self.assertLess(out.index("working…"), out.index("→ read README.md"))
+        self.assertLess(out.index("→ read README.md"), out.index("the heading is Title"))
+
+    def test_write_asks_in_plain_language_before_it_runs(self):
+        raw = json.dumps({"path": "notes.txt", "content": "ok"})
+        call = ToolCall(
+            id="1",
+            name="write_file",
+            arguments=raw,
+            parsed={"path": "notes.txt", "content": "ok"},
+        )
+        raw_call = {"id": "1", "type": "function", "function": {"name": "write_file", "arguments": raw}}
+
+        def fake_complete(messages, tools, settings, key):
+            if any(m.get("role") == "tool" for m in messages):
+                return Completion(content="did not write")
+            return Completion(content="", tool_calls=[call], raw_tool_calls=[raw_call])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            save_choice(home, provider="openai", model="gpt-test")
+            with patch("urllib.request.urlopen", side_effect=AssertionError("network")):
+                with patch("tunic.agent.complete", side_effect=fake_complete):
+                    code, out, err = SessionTests()._run(
+                        ["write a note", "n", "/exit"],
+                        home,
+                        home,
+                        extra_env={"OPENAI_API_KEY": "test-key"},
+                    )
+            self.assertEqual(code, 0, err)
+            self.assertIn("Write notes.txt?", out)
+            self.assertIn("Allow it?", out)
+            self.assertLess(out.index("working…"), out.index("→ write notes.txt"))
+            self.assertLess(out.index("→ write notes.txt"), out.index("Allow it?"))
+            self.assertIn("permission denied", out)
+            self.assertFalse((home / "notes.txt").exists())
+            self.assertNotIn("test-key", out)
+            self.assertNotIn("test-key", err)
+
+    def test_yes_writes_without_asking(self):
+        raw = json.dumps({"path": "notes.txt", "content": "ok"})
+        call = ToolCall(
+            id="1",
+            name="write_file",
+            arguments=raw,
+            parsed={"path": "notes.txt", "content": "ok"},
+        )
+        raw_call = {"id": "1", "type": "function", "function": {"name": "write_file", "arguments": raw}}
+
+        def fake_complete(messages, tools, settings, key):
+            if any(m.get("role") == "tool" for m in messages):
+                return Completion(content="wrote it")
+            return Completion(content="", tool_calls=[call], raw_tool_calls=[raw_call])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            save_choice(home, provider="openai", model="gpt-test")
+            with patch("tunic.agent.complete", side_effect=fake_complete):
+                code, out, err = SessionTests()._run(
+                    ["write a note", "/exit"],
+                    home,
+                    home,
+                    extra_env={"OPENAI_API_KEY": "test-key"},
+                    argv=["--yes"],
+                )
+            self.assertEqual(code, 0, err)
+            self.assertNotIn("Allow it?", out)
+            self.assertIn("working…", out)
+            self.assertIn("→ write notes.txt", out)
+            self.assertIn("wrote it", out)
+            self.assertEqual((home / "notes.txt").read_text(encoding="utf-8"), "ok")
+            self.assertNotIn("test-key", out)
+
+    def test_shell_asks_before_it_runs(self):
+        raw = json.dumps({"command": "echo tunic-ok"})
+        call = ToolCall(id="1", name="bash", arguments=raw, parsed={"command": "echo tunic-ok"})
+        raw_call = {"id": "1", "type": "function", "function": {"name": "bash", "arguments": raw}}
+
+        def fake_complete(messages, tools, settings, key):
+            if any(m.get("role") == "tool" for m in messages):
+                return Completion(content="did not run")
+            return Completion(content="", tool_calls=[call], raw_tool_calls=[raw_call])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            save_choice(home, provider="openai", model="gpt-test")
+            with patch("tunic.agent.complete", side_effect=fake_complete):
+                code, out, err = SessionTests()._run(
+                    ["run it", "n", "/exit"],
+                    home,
+                    home,
+                    extra_env={"OPENAI_API_KEY": "test-key"},
+                )
+        self.assertEqual(code, 0, err)
+        self.assertIn("shell command", out)
+        self.assertIn("echo tunic-ok", out)
+        self.assertIn("Allow it?", out)
+        self.assertLess(out.index("→ run echo tunic-ok"), out.index("Allow it?"))
+        self.assertIn("permission denied", out)
+
+    def test_custom_url_saves_and_a_secret_url_does_not(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            code, out, err = SessionTests()._run(
+                ["/settings", "8", "http://127.0.0.1:9/v1", "local-test", "/exit"],
+                home,
+                home,
+                fetch=lambda settings, timeout=15: [{"id": "already-loaded", "state": "loaded"}],
+            )
+            saved = json.loads((home / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(code, 0, err)
+            self.assertEqual(saved["provider"], "custom")
+            self.assertEqual(saved["model"], "local-test")
+            self.assertEqual(saved["base_url"], "http://127.0.0.1:9/v1")
+            self.assertNotIn("pass", saved)
+            self.assertEqual(out.count("tunic 0.1.0"), 1)
+            with self.assertRaises(ConfigError) as caught:
+                save_choice(
+                    home,
+                    provider="custom",
+                    model="m",
+                    base_url="http://user:super-secret-value@127.0.0.1:9/v1",
+                )
+            text = (home / "config.json").read_text(encoding="utf-8")
+            self.assertNotIn("super-secret-value", str(caught.exception))
+            self.assertNotIn("super-secret-value", text)
+            self.assertEqual(json.loads(text)["base_url"], "http://127.0.0.1:9/v1")
+            save_choice(home, provider="openai", model="gpt-test", base_url="http://127.0.0.1:9/v1")
+            cloud = json.loads((home / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(cloud["base_url"], "https://api.openai.com/v1")
+            self.assertNotIn("127.0.0.1:9", cloud["base_url"])
+
+    def test_unknown_slash_is_not_sent_to_the_model(self):
+        def fetch(settings, timeout=15):
+            return [{"id": "already-loaded", "state": "loaded"}]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            with patch("tunic.cli.run_turn", side_effect=AssertionError("sent")):
+                code, out, err = SessionTests()._run(["/nope", "/exit"], home, home, fetch=fetch)
+        self.assertEqual(code, 0, err)
+        self.assertIn("unknown command", out)
+        self.assertIn("/help", out)
+
+    def test_headless_emit_still_contains_tool_call(self):
+        raw = json.dumps({"command": "echo tunic-ok"})
+        call = ToolCall(id="1", name="bash", arguments=raw, parsed={"command": "echo tunic-ok"})
+        raw_call = {"id": "1", "type": "function", "function": {"name": "bash", "arguments": raw}}
+
+        def fake_complete(messages, tools, settings, key):
+            if any(m.get("role") == "tool" for m in messages):
+                return Completion(content="tunic-ok")
+            return Completion(content="", tool_calls=[call], raw_tool_calls=[raw_call])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"TUNIC_HOME": tmp, "HOME": tmp, "PATH": os.environ.get("PATH", "")}, clear=True):
+                with patch("tunic.agent.complete", side_effect=fake_complete):
+                    with redirect_stdout(io.StringIO()) as buf:
+                        code = main(
+                            [
+                                "--provider",
+                                "custom",
+                                "--base-url",
+                                "http://127.0.0.1:9/v1",
+                                "--model",
+                                "m",
+                                "--yes",
+                                "-p",
+                                "hi",
+                            ]
+                        )
+        text = buf.getvalue()
+        self.assertEqual(code, 0)
+        self.assertIn("tool-call", text)
+        self.assertIn("stream: false", text)
+        self.assertNotIn("working…", text)
+        self.assertNotIn("\033[", text)
 
 
 if __name__ == "__main__":

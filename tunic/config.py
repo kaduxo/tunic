@@ -151,6 +151,25 @@ def load_config_file() -> dict:
     return data
 
 
+def _public_base_url(base_url: str) -> str:
+    cleaned = str(base_url).strip().rstrip("/")
+    if not cleaned or any(ch.isspace() for ch in cleaned) or len(cleaned) > 200:
+        raise ConfigError("base url is not usable. Nothing saved.")
+    parsed = urlparse(cleaned)
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or "@" in (parsed.netloc or "")
+    ):
+        raise ConfigError("base url must be an absolute http(s) URL with no password. Nothing saved.")
+    lowered = cleaned.lower()
+    if "sk-" in lowered or "eyj" in lowered:
+        raise ConfigError("base url must not include a secret. Nothing saved.")
+    return cleaned
+
+
 def ensure_home() -> Path:
     home = tunic_home()
     home.mkdir(parents=True, exist_ok=True)
@@ -343,6 +362,7 @@ def save_choice(
     model: str,
     pass_name: str | None = None,
     auth: str | None = None,
+    base_url: str | None = None,
 ) -> None:
     """Write the user default. Never write a key or a token.
 
@@ -381,7 +401,13 @@ def save_choice(
         local["provider"] = "lmstudio"
     data["provider"] = provider
     data["model"] = model_value
-    if provider == "lmstudio":
+    # A typed URL is only for a local endpoint. Cloud providers keep their
+    # official URL so a saved choice cannot retarget a cloud key.
+    if provider in {"ollama", "vllm", "custom"} and base_url:
+        data["base_url"] = _public_base_url(base_url)
+    elif provider == "custom":
+        raise ConfigError("custom provider needs a base URL. Nothing saved.")
+    elif provider == "lmstudio":
         kept = previous_url if previous == "lmstudio" and previous_url else None
         if not kept:
             profiles = data.get("profiles")

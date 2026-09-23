@@ -137,22 +137,29 @@ def _cap(text: str) -> str:
     return text[:OUTPUT_CAP] + "\n[truncated]"
 
 
-def _permission(name: str, settings: Settings, ask) -> str | None:
+def _permission(name: str, settings: Settings, ask, arguments: dict | None) -> str | None:
     if name in ("read_file", "list_dir"):
         return None
     if settings.plan:
         return "permission denied: plan mode is read-only (bash and write_file are off)"
     if settings.yes:
         return None
-    if ask is not None and ask(name):
+    if ask is not None and _granted(ask, name, arguments or {}):
         return None
     if ask is None:
         return "permission denied: mutating tools need --yes, or run in a terminal and answer y"
     return "permission denied"
 
 
+def _granted(ask, name: str, arguments: dict) -> bool:
+    try:
+        return bool(ask(name, arguments))
+    except TypeError:
+        return bool(ask(name))
+
+
 def run_tool(name: str, arguments: dict | None, settings: Settings, ask=None) -> str:
-    denied = _permission(name, settings, ask)
+    denied = _permission(name, settings, ask, arguments)
     if denied:
         return denied
     if not isinstance(arguments, dict):

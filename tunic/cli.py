@@ -12,7 +12,7 @@ from tunic.config import PROVIDERS, ConfigError, ensure_home, resolve_settings, 
 from tunic.keys import KeyMissing, key_status
 from tunic.providers import ProviderError, fetch_lmstudio_catalog
 from tunic.session import load_session, save_session
-from tunic.ui import ActivityView
+from tunic.ui import ActivityView, format_slash_help, paint, paint_block, permission_question, write_label
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -31,7 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cwd", help="Working directory for file and bash tools")
     parser.add_argument("--session", help="Resume or save a session name")
     parser.add_argument("--allow-load", action="store_true", help="Permit an LM Studio model that is not already loaded")
-    parser.add_argument("--no-color", action="store_true")
+    parser.add_argument("--no-color", action="store_true", help="Disable color")
     parser.add_argument("--max-steps", type=int)
     parser.add_argument("--max-tokens", type=int)
     parser.add_argument("--temperature", type=float)
@@ -84,9 +84,22 @@ def _emit(settings, text: str) -> None:
     print(text, flush=True)
 
 
-def _show(view: ActivityView, text: str) -> None:
+def _show(view: ActivityView, text: str, settings=None) -> None:
+    enabled = bool(settings is not None and not settings.no_color)
     for line in view.feed(text):
+        if line.startswith("→"):
+            line = paint(line, "36", enabled=enabled)
+        elif line.startswith("  "):
+            line = paint(line, "2", enabled=enabled)
         print(line, flush=True)
+
+
+def _working_line(settings) -> str:
+    return paint("working…", "2", enabled=not settings.no_color)
+
+
+def _print_screen(settings, text: str) -> None:
+    print(paint_block(text, enabled=not settings.no_color), flush=True)
 
 
 def _headless(settings, prompt: str) -> int:
@@ -155,11 +168,8 @@ def _models(settings) -> int:
 
 
 def _repl(settings) -> int:
-    print(f"tunic {__version__}", flush=True)
-    print(f"project: {settings.cwd}", flush=True)
-    print(f"provider: {settings.provider}", flush=True)
-    print(f"model: {model_text(settings)}", flush=True)
-    print("/settings to change the model    /help    /exit", flush=True)
+    _print_screen(settings, format_banner(settings, model_text(settings)))
+    print(flush=True)
     messages: list[dict] | None = None
     if settings.session:
         try:
@@ -182,14 +192,22 @@ def _repl(settings) -> int:
         if line in ("/exit", "/quit"):
             return 0
         if line == "/help":
-            print("/exit  /plan  /compact  /model ID  /session NAME  /settings")
+            print(format_slash_help())
             continue
         if line in ("/settings", "/config"):
             _settings_mode(settings)
             continue
         if line == "/plan":
             settings.plan = not settings.plan
-            print(f"plan: {'on' if settings.plan else 'off'}")
+            _print_screen(
+                settings,
+                "\n".join(
+                    [
+                        f"plan: {'on' if settings.plan else 'off'}",
+                        f"writes: {write_label(settings)}",
+                    ]
+                ),
+            )
             continue
         if line == "/compact":
             if messages:
@@ -205,14 +223,20 @@ def _repl(settings) -> int:
             settings.session = line.split(None, 1)[1].strip()
             print(f"session: {settings.session}")
             continue
+        if line in ("/model", "/session"):
+            print("usage: /model ID" if line == "/model" else "usage: /session NAME")
+            continue
+        if line.startswith("/"):
+            print("unknown command. /help lists them.")
+            continue
         ask = _interactive_ask if sys.stdin.isatty() else None
         view = ActivityView()
-        print("thinking…", flush=True)
+        print(_working_line(settings), flush=True)
         try:
             result = run_turn(
                 line,
                 settings,
-                emit=lambda text: _show(view, text),
+                emit=lambda text, view=view: _show(view, text, settings),
                 ask=ask,
                 prior=messages,
             )
@@ -230,23 +254,42 @@ def _repl(settings) -> int:
                 print(f"tunic: {exc}", file=sys.stderr)
 
 
-def _interactive_ask(name: str) -> bool:
+def _interactive_ask(name: str, arguments: dict | None = None) -> bool:
     try:
-        verb = {"bash": "run a command", "write_file": "write a file"}.get(name, name)
-        answer = input(f"allow {verb}? [y/N] ")
-    except EOFError:
+        answer = input(permission_question(name, arguments))
+    except (EOFError, KeyboardInterrupt):
+        print()
         return False
     return answer.strip().lower() in ("y", "yes")
 
 
 def format_banner(settings, model_line: str) -> str:
+    hint = "/settings  choose a connection    /help  commands    /exit  leave"
+    rule = "─" * len(hint)
     return "\n".join(
         [
             f"tunic {__version__}",
+            rule,
             f"project: {settings.cwd}",
             f"provider: {settings.provider}",
             f"model: {model_line}",
-            "/settings to change the model    /help    /exit",
+            f"plan: {'on' if settings.plan else 'off'}",
+            f"writes: {write_label(settings)}",
+            rule,
+            hint,
+        ]
+    )
+
+
+def format_status(settings, model_line: str) -> str:
+    """Saved confirmation. Not a second copy of the launch screen."""
+    return "\n".join(
+        [
+            "saved",
+            f"provider: {settings.provider}",
+            f"model: {model_line}",
+            f"plan: {'on' if settings.plan else 'off'}",
+            f"writes: {write_label(settings)}",
         ]
     )
 
@@ -280,6 +323,12 @@ def model_text(settings, fetch=None) -> str:
     return str(with_tools or loaded[0])
 
 
+def _announce_key(provider: str) -> None:
+    env_name = PROVIDERS[provider].get("env")
+    if env_name:
+        print(f"{provider}: set {env_name}, or a pass entry name. The secret is not saved.")
+
+
 def _ask_line(prompt: str) -> str | None:
     try:
         return input(prompt).strip()
@@ -310,12 +359,17 @@ def _apply_saved(settings) -> None:
 
 
 def _settings_mode(settings) -> None:
-    print("settings — saved for the next launch")
+    print("settings — choose a connection. Saved for the next launch.")
     if settings.profile:
         print("note: an active profile overrides this default on launch")
-    print("  1  local model (LM Studio)")
-    print("  2  API (OpenAI or Anthropic)")
+    print("  1  LM Studio     local, already loaded")
+    print("  2  API           OpenAI or Anthropic")
     print("  3  grok / xAI")
+    print("  4  ollama        local")
+    print("  5  vllm          local")
+    print("  6  openrouter")
+    print("  7  groq")
+    print("  8  custom URL")
     print("  q  back")
     choice = _ask_line("settings> ")
     if choice is None or choice in ("q", "quit", "back", ""):
@@ -326,6 +380,16 @@ def _settings_mode(settings) -> None:
         _save_api(settings)
     elif choice == "3":
         _save_xai(settings)
+    elif choice == "4":
+        _save_connection(settings, "ollama")
+    elif choice == "5":
+        _save_connection(settings, "vllm")
+    elif choice == "6":
+        _save_connection(settings, "openrouter")
+    elif choice == "7":
+        _save_connection(settings, "groq")
+    elif choice == "8":
+        _save_connection(settings, "custom")
     else:
         print("tunic: unknown settings choice")
 
@@ -379,6 +443,7 @@ def _save_api(settings) -> None:
     else:
         print("tunic: nothing saved.")
         return
+    _announce_key(provider)
     model = _ask_line("model id: ")
     if model is None:
         return
@@ -391,6 +456,7 @@ def _save_api(settings) -> None:
 
 
 def _save_xai(settings) -> None:
+    _announce_key("xai")
     model = _ask_line("model id: ")
     if model is None:
         return
@@ -402,25 +468,66 @@ def _save_xai(settings) -> None:
         print("xai: a model id is required before a turn. No request was sent.")
 
 
+def _save_connection(settings, provider: str) -> None:
+    spec = PROVIDERS[provider]
+    base_url = None
+    if provider in ("ollama", "vllm", "custom"):
+        shown = spec["base_url"] or "required"
+        raw = _ask_line(f"base url [{shown}]: ")
+        if raw is None:
+            return
+        if raw:
+            base_url = raw
+        elif provider == "custom":
+            print("tunic: custom needs a base url. Nothing saved.")
+            return
+    model = _ask_line("model id: ")
+    if model is None:
+        return
+    pass_name = None
+    if spec["needs_key"]:
+        _announce_key(provider)
+        pass_name = _ask_line("pass entry name (or empty): ")
+        if pass_name is None:
+            return
+    if not _commit_choice(
+        settings,
+        provider=provider,
+        model=model,
+        pass_name=pass_name or None,
+        auth=None,
+        base_url=base_url,
+    ):
+        return
+    if spec["needs_key"] and settings.provider == provider and not settings.model:
+        print(f"{provider}: a model id is required before a turn. No request was sent.")
+
+
 def _save_model(settings, model: str) -> None:
-    if _commit_choice(
+    _commit_choice(
         settings,
         provider=settings.provider,
         model=model,
         pass_name=settings.pass_name,
         auth=settings.auth,
-    ):
-        print(f"model: {settings.model}")
+    )
 
 
-def _commit_choice(settings, *, provider: str, model: str, pass_name, auth) -> bool:
+def _commit_choice(settings, *, provider: str, model: str, pass_name, auth, base_url=None) -> bool:
     try:
-        save_choice(settings.home, provider=provider, model=model, pass_name=pass_name, auth=auth)
+        save_choice(
+            settings.home,
+            provider=provider,
+            model=model,
+            pass_name=pass_name,
+            auth=auth,
+            base_url=base_url,
+        )
     except ConfigError as exc:
         print(f"tunic: {exc}")
         return False
     _apply_saved(settings)
-    print(format_banner(settings, model_text(settings)))
+    _print_screen(settings, format_status(settings, model_text(settings)))
     return True
 
 

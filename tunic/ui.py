@@ -1,4 +1,4 @@
-"""Interactive activity lines. Headless output stays machine-readable."""
+"""Interactive screen. Headless output stays machine-readable."""
 
 from __future__ import annotations
 
@@ -73,6 +73,84 @@ def _preview(text: str) -> str:
     if extra:
         return f"{first} (+{extra} lines)"
     return first
+
+
+def write_label(settings) -> str:
+    """Whether a write or a shell may run without asking."""
+    if settings.plan:
+        return "off (plan mode)"
+    if settings.yes:
+        return "allowed (--yes)"
+    return "ask before a write or a shell"
+
+
+def paint(text: str, code: str, *, enabled: bool) -> str:
+    """Wrap one line. The text itself stays contiguous so a search still matches."""
+    if not enabled or not code or text == "":
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def tone_for(line: str) -> str:
+    if line.startswith("tunic "):
+        return "1"
+    if line.startswith("─"):
+        return "2"
+    if line.startswith(("writes: ask", "writes: off", "plan: on")):
+        return "33"
+    if line.startswith("writes: allowed"):
+        return "32"
+    if line.startswith(("project:", "provider:", "model:", "plan:", "writes:", "saved")):
+        return "36"
+    if line.startswith("/"):
+        return "2"
+    return ""
+
+
+def paint_block(text: str, *, enabled: bool) -> str:
+    return "\n".join(paint(line, tone_for(line), enabled=enabled) for line in text.splitlines())
+
+
+def format_slash_help() -> str:
+    """Every interactive command, one meaning each."""
+    width = max(len(name) for name, _meaning in SLASH_HELP)
+    lines = ["Commands"]
+    for name, meaning in SLASH_HELP:
+        lines.append(f"  {name:<{width}}  {meaning}")
+    lines.append("A write or a shell command asks in plain language before it runs, unless --yes.")
+    return "\n".join(lines)
+
+
+def permission_question(name: str, arguments: dict | None = None) -> str:
+    """Plain-language ask. The tool has not run yet."""
+    data = arguments if isinstance(arguments, dict) else {}
+    if name == "bash":
+        command = data.get("command")
+        if isinstance(command, str) and command.strip():
+            return (
+                "Run this shell command before continuing: "
+                f"{_one_line(command, 72)}\nAllow it? [y/N] "
+            )
+        return "Run a shell command before continuing?\nAllow it? [y/N] "
+    if name == "write_file":
+        path = data.get("path")
+        if isinstance(path, str) and path.strip():
+            return f"Write {_one_line(path, 72)}? This changes the project.\nAllow it? [y/N] "
+        return "Write a file? This changes the project.\nAllow it? [y/N] "
+    return f"Allow {name} before it runs? [y/N] "
+
+
+SLASH_HELP = (
+    ("/exit", "leave this session"),
+    ("/quit", "leave this session"),
+    ("/help", "list these commands"),
+    ("/settings", "choose a connection and model"),
+    ("/config", "same as /settings"),
+    ("/plan", "turn plan mode on or off (read-only)"),
+    ("/compact", "shorten the remembered turns"),
+    ("/model ID", "save a different model for this connection"),
+    ("/session NAME", "name this session so it can be resumed"),
+)
 
 
 def _one_line(text: str, limit: int) -> str:
