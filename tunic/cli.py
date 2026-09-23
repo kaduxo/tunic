@@ -100,7 +100,7 @@ def _show(view: ActivityView, text: str, settings, frame: OpenBox) -> None:
             line = paint(line, "36", enabled=enabled)
         elif line.startswith("  "):
             line = paint(line, "2", enabled=enabled)
-        print(_paint_turn_row(settings, frame.row(line)), flush=True)
+        _emit_turn_row(settings, frame, line)
 
 
 def _working_line(settings) -> str:
@@ -119,6 +119,13 @@ def _paint_turn_row(settings, row: str) -> str:
 def _close_turn(settings, frame: OpenBox) -> None:
     if frame.is_open:
         print(paint(frame.end(), "2", enabled=not settings.no_color), flush=True)
+
+
+def _emit_turn_row(settings, frame: OpenBox, text: str) -> None:
+    """A row in the turn box. Reopens the box if a question closed it."""
+    if not frame.is_open:
+        print(paint(frame.start(), "2", enabled=not settings.no_color), flush=True)
+    print(_paint_turn_row(settings, frame.row(text)), flush=True)
 
 
 def _print_screen(settings, text: str) -> None:
@@ -252,11 +259,16 @@ def _repl(settings) -> int:
         if line.startswith("/"):
             print("unknown command. /help lists them.")
             continue
-        ask = _interactive_ask if sys.stdin.isatty() else None
         view = ActivityView()
         frame = OpenBox("turn")
-        print(paint(frame.start(), "2", enabled=not settings.no_color), flush=True)
-        print(_paint_turn_row(settings, frame.row(_working_line(settings))), flush=True)
+
+        def pause_for_ask(name, arguments=None):
+            # The question is not a step. Close the box so it is not drawn through the frame.
+            _close_turn(settings, frame)
+            return _interactive_ask(name, arguments)
+
+        ask = pause_for_ask if sys.stdin.isatty() else None
+        _emit_turn_row(settings, frame, _working_line(settings))
         try:
             result = run_turn(
                 line,
