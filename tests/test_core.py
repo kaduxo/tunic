@@ -21,6 +21,7 @@ from tunic.config import LMSTUDIO_BASE_URL, resolve_settings, save_choice
 from tunic.keys import KeyMissing, key_status, resolve_key
 from tunic.providers import Completion, ProviderError, ToolCall, build_anthropic_payload, build_openai_payload
 from tunic.tools import builtin_tools, resolve_user_path, run_tool
+from tunic.ui import ActivityView
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -669,6 +670,34 @@ class ChoiceUnitTests(unittest.TestCase):
             prompt = system_prompt(settings)
         self.assertIn(str(Path(tmp).resolve()), prompt)
         self.assertIn("Relative paths are inside this project", prompt)
+
+
+class ActivityViewTests(unittest.TestCase):
+    def test_hides_transport_lines_and_names_the_step(self):
+        view = ActivityView()
+        shown = []
+        for line in (
+            "provider: lmstudio",
+            "model: local-model",
+            "stream: false",
+            'tool-call id=1 name=read_file arguments={"path": "README.md"}',
+            "tool-result: read_file",
+            "hello\nworld",
+            "assistant: done",
+        ):
+            shown.extend(view.feed(line))
+        self.assertEqual(shown[0], "→ read README.md")
+        self.assertEqual(shown[1], "  hello (+1 lines)")
+        self.assertEqual(shown[2:], ["", "done"])
+
+    def test_bash_and_write_stay_one_line(self):
+        view = ActivityView()
+        self.assertEqual(
+            view.feed('tool-call id=2 name=bash arguments={"command": "ls -la"}'),
+            ["→ run ls -la"],
+        )
+        view.feed("tool-result: bash")
+        self.assertEqual(view.feed("exit=0\nstdout:\nok"), ["  exit=0 (+2 lines)"])
 
 
 if __name__ == "__main__":

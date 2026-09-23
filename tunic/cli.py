@@ -12,6 +12,7 @@ from tunic.config import PROVIDERS, ConfigError, ensure_home, resolve_settings, 
 from tunic.keys import KeyMissing, key_status
 from tunic.providers import ProviderError, fetch_lmstudio_catalog
 from tunic.session import load_session, save_session
+from tunic.ui import ActivityView
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -83,6 +84,11 @@ def _emit(settings, text: str) -> None:
     print(text, flush=True)
 
 
+def _show(view: ActivityView, text: str) -> None:
+    for line in view.feed(text):
+        print(line, flush=True)
+
+
 def _headless(settings, prompt: str) -> int:
     prior = None
     if settings.session:
@@ -152,7 +158,8 @@ def _repl(settings) -> int:
     print(f"tunic {__version__}", flush=True)
     print(f"project: {settings.cwd}", flush=True)
     print(f"provider: {settings.provider}", flush=True)
-    print(format_banner(settings, model_text(settings)), flush=True)
+    print(f"model: {model_text(settings)}", flush=True)
+    print("/settings to change the model    /help    /exit", flush=True)
     messages: list[dict] | None = None
     if settings.session:
         try:
@@ -199,11 +206,13 @@ def _repl(settings) -> int:
             print(f"session: {settings.session}")
             continue
         ask = _interactive_ask if sys.stdin.isatty() else None
+        view = ActivityView()
+        print("thinking…", flush=True)
         try:
             result = run_turn(
                 line,
                 settings,
-                emit=lambda text: _emit(settings, text),
+                emit=lambda text: _show(view, text),
                 ask=ask,
                 prior=messages,
             )
@@ -223,7 +232,8 @@ def _repl(settings) -> int:
 
 def _interactive_ask(name: str) -> bool:
     try:
-        answer = input(f"allow {name}? [y/N] ")
+        verb = {"bash": "run a command", "write_file": "write a file"}.get(name, name)
+        answer = input(f"allow {verb}? [y/N] ")
     except EOFError:
         return False
     return answer.strip().lower() in ("y", "yes")

@@ -32,7 +32,7 @@ cd /path/to/project
 tonic
 ```
 
-The first screen names that directory. The session is bound to it. Relative paths stay inside it.
+The first screen names that directory. The session is bound to it. Each step is one line: read, write, list, or run. The answer comes after the steps.
 
 ```bash
 tunic -p "read README.md and say the first heading"
