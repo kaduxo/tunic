@@ -2,6 +2,10 @@
 
 Local-first agentic CLI. A small model drives the tools. Cloud providers are optional.
 
+## Why it exists
+
+Every agentic CLI assumes a frontier cloud model — one that can juggle parallel tool calls, long streams, and deep tool chains. A 35B-class local model breaks under those assumptions: it over-calls, invents tools, or leaves an open stream hanging on your GPU box. Tunic is built the other way around: one tool at a time, the provider's real schema, no stream, and a hard refusal if the model you named isn't actually loaded. Built for daily use on a home LM Studio server — solid enough that it's the CLI I run my own ops through.
+
 ## Install
 
 ```bash
@@ -66,3 +70,7 @@ Same shape for `xai` / `XAI_API_KEY` / `TUNIC_XAI_PASS`, `anthropic` / `ANTHROPI
 2. Tool schemas are the provider's real schema, not a wrapper.
 3. `stream` is false. A local server must not be left on an open stream.
 4. Paths are lenient: relative, `~`, and absolute. Relative paths stay in the launch directory.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
