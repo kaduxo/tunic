@@ -40,6 +40,7 @@ from tunic.ui import (
     paint,
     auto_label,
     paint_block,
+    format_ask,
     permission_question,
     rule,
     write_label,
@@ -486,7 +487,12 @@ def _repl(settings) -> int:
             _close_turn(settings, frame)
             return _interactive_ask(name, arguments, settings)
 
+        def pause_for_question(question, choices=None):
+            _close_turn(settings, frame)
+            return _interactive_question(question, choices, settings)
+
         ask = pause_for_ask if sys.stdin.isatty() else None
+        reply = pause_for_question if sys.stdin.isatty() else None
         _emit_turn_row(settings, frame, _working_line(settings))
 
         def emit_line(text, view=view, frame=frame):
@@ -501,6 +507,7 @@ def _repl(settings) -> int:
                 settings,
                 emit=emit_line,
                 ask=ask,
+                reply=reply,
                 prior=messages,
                 **turn_kw,
             )
@@ -552,6 +559,28 @@ def _interactive_ask(name: str, arguments: dict | None = None, settings=None) ->
         print()
         return False
     return answer.strip().lower() in ("y", "yes")
+
+
+def _interactive_question(question: str, choices=None, settings=None) -> str:
+    options = [item for item in (choices or []) if isinstance(item, str) and item.strip()]
+    body = format_ask(question, options)
+    try:
+        if settings is not None:
+            _print_screen(settings, boxed("question", body))
+            raw = input("ask> ")
+        else:
+            raw = input(question + " ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return "the user declined to answer"
+    text = raw.strip()
+    if not text:
+        return "(empty)"
+    if options and text.isdigit():
+        index = int(text)
+        if 1 <= index <= len(options):
+            return options[index - 1]
+    return text
 
 
 def format_banner(settings, model_line: str) -> str:

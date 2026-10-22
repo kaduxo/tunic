@@ -28,7 +28,7 @@ Call exactly one tool at a time. A tool call must be a real function call, never
 Prefer list_dir, read_file, search, and edit_file over bash. Use bash only to run a command.
 To change part of a file: search, then edit_file that span. Do not send the whole file to write_file.
 Paths may be relative or start with ~. start and end are line numbers from search.
-After a tool result comes back, continue the task. When the task is done, answer in plain text and do not call a tool.
+After a tool result comes back, continue the task. If a path, name, constraint, or choice is missing, call ask. Do not guess. When the task is done, answer in plain text and do not call a tool.
 
 Slash commands are typed by the user in the CLI. You cannot run them. If the user needs one, tell them the command:
 /auto on, /auto off, /model, /settings, /plan, /go, /help, /exit, /steps N, /continue, /sessions, /undo, /skill.
@@ -42,7 +42,8 @@ If a request is outside those bounds, refuse in plain text and stop.
 """
 
 PLAN_ADDENDUM = (
-    "Plan mode: do not call bash, write_file, or edit_file. Use read_file, list_dir, and search, then write the plan in plain text."
+    "Plan mode: do not call bash, write_file, or edit_file. Use read_file, list_dir, search, fetch, and ask. "
+    "If a choice is missing, call ask, then write the plan in plain text."
 )
 
 NUDGE = "That was not a tool call. Call the tool now. Do not write a code fence."
@@ -107,6 +108,7 @@ def _session_card(settings: Settings) -> str:
         "- edit_file {\"path\": \"...\", \"start\": \"N\", \"end\": \"N\", \"content\": \"...\"} — replace a line span\n"
         "- write_file {\"path\": \"...\", \"content\": \"...\"} — write a whole file\n"
         "- fetch {\"url\": \"https://...\"} — GET a public https page as text; private hosts refused\n"
+        "- ask {\"question\": \"...\", \"choices\": \"one\\ntwo\"} — ask the user; works in plan mode; do not guess\n"
         "- bash {\"command\": \"...\"} — run a shell command in the project"
     )
 
@@ -201,6 +203,7 @@ def run_turn(
     ask=None,
     prior: list[dict] | None = None,
     on_delta=None,
+    reply=None,
 ) -> TurnResult:
     key = resolve_key(settings)
     prepare_model(settings)
@@ -246,7 +249,7 @@ def run_turn(
                 if call.parsed is None:
                     text = "tool error: arguments were not a JSON object"
                 else:
-                    text = run_tool(call.name, call.parsed, settings, ask=ask)
+                    text = run_tool(call.name, call.parsed, settings, ask=ask, reply=reply)
             except KeyboardInterrupt:
                 return _stop_turn(result, messages, emit, "interrupt", "the user stopped this turn.")
             emit(f"tool-result: {call.name}")

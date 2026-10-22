@@ -28,6 +28,7 @@ _LABELS = {
     "search": "search",
     "edit_file": "edit",
     "fetch": "fetch",
+    "ask": "ask",
 }
 
 
@@ -88,6 +89,8 @@ def _action(name: str, arguments: str) -> str:
             target = f"{target} in {glob}"
     elif name == "fetch":
         target = data.get("url")
+    elif name == "ask":
+        target = data.get("question")
     else:
         target = data.get("path")
     if not isinstance(target, str) or not target.strip():
@@ -250,6 +253,13 @@ def format_slash_help() -> str:
             rows.append(f"{name:<{width}}  {meaning[name]}")
     note = "A write or a shell command asks in plain language before it runs, unless /auto on, --yes, or config yes."
     return boxed("Commands", rows) + "\n" + note
+
+
+def format_ask(question: str, choices: list[str] | None = None) -> list[str]:
+    rows = [question.strip() or "Need a bit more context."]
+    for index, choice in enumerate(choices or [], start=1):
+        rows.append(f"  {index}  {choice}")
+    return rows
 
 
 def permission_question(name: str, arguments: dict | None = None) -> str:

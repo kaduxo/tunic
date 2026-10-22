@@ -59,9 +59,10 @@ Tools run one at a time. Plan mode keeps the read-only tools and refuses the res
 | `edit_file` | Replace one line span from `search`. Other lines stay. Prints a short diff. `/undo` restores it. |
 | `write_file` | Create or replace a whole text file. Prints a short diff. `/undo` restores it. |
 | `fetch` | GET a public https page as text. HTML is stripped. Localhost, private, and credentialed URLs are refused. |
+| `ask` | Ask the user a question mid-turn when a path, name, constraint, or choice is missing. Optional `choices` (one per line or `\|`). Works in plan mode. Do not guess. |
 | `bash` | Run a shell command in the project directory. Prefer the file tools for reads and edits. |
 
-`write_file`, `edit_file`, and `bash` ask before they run unless auto mode is on. Plan mode refuses them. Secret paths (`~/.tunic/env`, `/proc/*/environ`) stay blocked even with auto on.
+`write_file`, `edit_file`, and `bash` ask before they run unless auto mode is on. Plan mode refuses them. `ask` still runs in plan mode. Secret paths (`~/.tunic/env`, `/proc/*/environ`) stay blocked even with auto on. Headless `-p` has no person to answer, so `ask` returns that and the model continues with what it has.
 
 ## Commands
 

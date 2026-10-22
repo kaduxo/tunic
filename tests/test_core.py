@@ -153,7 +153,7 @@ class SerialTests(unittest.TestCase):
             order = []
             in_flight = {"n": 0}
 
-            def slow(name, arguments, settings, ask=None):
+            def slow(name, arguments, settings, ask=None, reply=None):
                 self.assertEqual(in_flight["n"], 0)
                 in_flight["n"] += 1
                 order.append(arguments["command"])
@@ -822,6 +822,8 @@ class ChoiceUnitTests(unittest.TestCase):
         self.assertIn("max tool steps this turn:", prompt)
         self.assertIn("glob", prompt)
         self.assertIn("fetch", prompt)
+        self.assertIn("ask", prompt)
+        self.assertIn("Do not guess", prompt)
         self.assertIn("git:", prompt)
 
     def test_prompt_loads_a_matching_skill(self):
@@ -1214,7 +1216,7 @@ class ScreenTests(unittest.TestCase):
         def fetch(settings, timeout=15):
             return [{"id": "already-loaded", "state": "loaded", "capabilities": ["tool_use"]}]
 
-        def fake_turn(prompt, settings, emit, ask=None, prior=None):
+        def fake_turn(prompt, settings, emit, ask=None, prior=None, on_delta=None, reply=None):
             emit('tool-call id=1 name=read_file arguments={"path": "README.md"}')
             emit("tool-result: read_file")
             emit("# Title")
@@ -1247,7 +1249,7 @@ class ScreenTests(unittest.TestCase):
         def fetch(settings, timeout=15):
             return [{"id": "already-loaded", "state": "loaded", "capabilities": ["tool_use"]}]
 
-        def fake_turn(prompt, settings, emit, ask=None, prior=None):
+        def fake_turn(prompt, settings, emit, ask=None, prior=None, on_delta=None, reply=None):
             emit('tool-call id=1 name=read_file arguments={"path": "README.md"}')
             emit("tool-result: read_file")
             emit("# Title")
@@ -1802,7 +1804,7 @@ class SpanSearchTests(unittest.TestCase):
             self.assertIs(payload["stream"], False)
             self.assertEqual(payload["tools"][0]["function"]["name"], "bash")
             names = [tool["function"]["name"] for tool in payload["tools"]]
-            for name in ("bash", "read_file", "write_file", "list_dir", "search", "edit_file", "fetch"):
+            for name in ("bash", "read_file", "write_file", "list_dir", "search", "edit_file", "fetch", "ask"):
                 self.assertIn(name, names)
             with patch.dict(os.environ, env, clear=True):
                 short = resolve_settings(
@@ -1968,7 +1970,7 @@ class HarnessTests(unittest.TestCase):
         def fetch(settings, timeout=15):
             return [{"id": "already-loaded", "state": "loaded"}]
 
-        def fake_turn(prompt, settings, emit, ask=None, prior=None, on_delta=None):
+        def fake_turn(prompt, settings, emit, ask=None, prior=None, on_delta=None, reply=None):
             seen.append((prompt, settings.plan))
             emit("assistant: ran the plan")
             from tunic.agent import TurnResult
@@ -1994,7 +1996,7 @@ class HarnessTests(unittest.TestCase):
         def fetch(settings, timeout=15):
             return [{"id": "already-loaded", "state": "loaded"}]
 
-        def fake_turn(prompt, settings, emit, ask=None, prior=None, on_delta=None):
+        def fake_turn(prompt, settings, emit, ask=None, prior=None, on_delta=None, reply=None):
             emit("assistant: ok")
             from tunic.agent import TurnResult
 
@@ -2128,6 +2130,66 @@ class HarnessTests(unittest.TestCase):
         view.feed("tool-result: write_file")
         shown = view.feed("wrote a.txt (3 chars)\n--- a.txt\n+++ a.txt\n-old\n+new")
         self.assertEqual(shown, ["  -old", "  +new"])
+
+    def test_ask_runs_in_plan_mode_and_headless_has_no_user(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = _settings(provider="lmstudio", plan=True, yes=True, home=Path(tmp), cwd=tmp)
+
+            def refuse(name, arguments):
+                raise AssertionError("ask is not a mutating permission prompt")
+
+            answered = run_tool(
+                "ask",
+                {"question": "which file?", "choices": "a.txt\nb.txt"},
+                plan,
+                ask=refuse,
+                reply=lambda question, choices: choices[1],
+            )
+            headless = run_tool(
+                "ask",
+                {"question": "which file?", "choices": "a.txt | b.txt"},
+                plan,
+            )
+        self.assertEqual(answered, "b.txt")
+        self.assertIn("no user to ask", headless)
+        self.assertIn("a.txt", headless)
+        self.assertIn("b.txt", headless)
+
+    def test_ask_pauses_the_turn_for_a_numbered_choice(self):
+        def fetch(settings, timeout=15):
+            return [{"id": "already-loaded", "state": "loaded"}]
+
+        def fake_complete(messages, tools, settings, key, on_delta=None):
+            if any(m.get("role") == "tool" for m in messages):
+                return Completion(content="picked " + (messages[-1].get("content") or ""), tool_calls=[])
+            return Completion(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="ask-1",
+                        name="ask",
+                        arguments='{"question": "which file?", "choices": "a.txt\\nb.txt"}',
+                        parsed={"question": "which file?", "choices": "a.txt\nb.txt"},
+                    )
+                ],
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            with patch("tunic.agent.complete", side_effect=fake_complete):
+                code, out, err = SessionTests()._run(
+                    ["need a file", "2", "/exit"],
+                    home,
+                    home,
+                    fetch=fetch,
+                    argv=["--provider", "custom", "--base-url", "http://127.0.0.1:9/v1", "--model", "m"],
+                )
+        self.assertEqual(code, 0, err)
+        self.assertIn("which file?", out)
+        self.assertIn("  1  a.txt", out)
+        self.assertIn("  2  b.txt", out)
+        self.assertIn("picked b.txt", out)
+        self.assertIn("ask>", out)
 
 
 if __name__ == "__main__":

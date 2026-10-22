@@ -15,7 +15,10 @@ from tunic.fetch import FetchError, get_public
 
 
 OUTPUT_CAP = 8000
-_READ_ONLY = frozenset({"read_file", "list_dir", "search", "fetch"})
+_READ_ONLY = frozenset({"read_file", "list_dir", "search", "fetch", "ask"})
+_HEADLESS_ASK = (
+    "no user to ask (headless). Continue with what you already have. Do not invent missing facts."
+)
 _UNDO_CAP = 20
 _DIFF_LINES = 16
 _SKIP_DIRS = frozenset({".git", "__pycache__", ".venv", "node_modules", ".hg"})
@@ -197,6 +200,23 @@ def builtin_tools() -> list[Tool]:
                 ["url"],
             ),
         ),
+        Tool(
+            name="ask",
+            description="Ask the user a question when a path, name, constraint, or choice is missing. Works in plan mode. Do not guess.",
+            schema=_object(
+                {
+                    "question": {
+                        "type": "string",
+                        "description": "One question. Short. The user will answer before you continue.",
+                    },
+                    "choices": {
+                        "type": "string",
+                        "description": "Optional choices, one per line or separated by |. The user may type a number or free text.",
+                    },
+                },
+                ["question"],
+            ),
+        ),
     ]
 
 
@@ -241,7 +261,7 @@ def _granted(ask, name: str, arguments: dict) -> bool:
         return bool(ask(name))
 
 
-def run_tool(name: str, arguments: dict | None, settings: Settings, ask=None) -> str:
+def run_tool(name: str, arguments: dict | None, settings: Settings, ask=None, reply=None) -> str:
     denied = _permission(name, settings, ask, arguments)
     if denied:
         return denied
@@ -265,6 +285,8 @@ def run_tool(name: str, arguments: dict | None, settings: Settings, ask=None) ->
             return _search(arguments, settings)
         if name == "fetch":
             return _fetch(arguments)
+        if name == "ask":
+            return _ask_user(arguments, reply)
     except ValueError as exc:
         return f"tool error: {exc}"
     except OSError as exc:
@@ -534,6 +556,48 @@ def _fetch(arguments: dict) -> str:
         return f"tool error: {exc}"
     if not text.strip():
         return "fetch: empty page"
+    return _cap(text)
+
+
+def _choice_lines(raw) -> list[str]:
+    if not isinstance(raw, str) or not raw.strip():
+        return []
+    if "\n" in raw:
+        parts = raw.splitlines()
+    elif "|" in raw:
+        parts = raw.split("|")
+    else:
+        parts = [raw]
+    choices = []
+    for part in parts:
+        text = " ".join(part.split())
+        if text and text not in choices:
+            choices.append(text)
+        if len(choices) >= 8:
+            break
+    return choices
+
+
+def _ask_user(arguments: dict, reply) -> str:
+    question = arguments.get("question")
+    if not isinstance(question, str) or not question.strip():
+        return "tool error: ask requires a question string"
+    question = " ".join(question.split())
+    if len(question) > 500:
+        question = question[:499] + "…"
+    choices = _choice_lines(arguments.get("choices"))
+    if reply is None:
+        extra = ""
+        if choices:
+            extra = " choices were: " + " | ".join(choices)
+        return _HEADLESS_ASK + extra
+    try:
+        answer = reply(question, choices)
+    except TypeError:
+        answer = reply(question)
+    if not isinstance(answer, str):
+        answer = str(answer)
+    text = answer.strip() or "(empty)"
     return _cap(text)
 
 
