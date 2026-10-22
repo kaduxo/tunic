@@ -50,6 +50,22 @@ def save_session(settings: Settings, name: str, messages: list[dict]) -> Path:
     return path
 
 
+def list_sessions(settings: Settings) -> list[str]:
+    folder = sessions_dir(settings)
+    paths = [path for path in folder.glob("*.jsonl") if path.is_file()]
+    paths.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return [path.stem for path in paths]
+
+
+def persist_session(settings: Settings, messages: list[dict], *, also: str | None = None) -> Path:
+    """Save the named session and always refresh `last`."""
+    primary = settings.session or also or "last"
+    path = save_session(settings, primary, messages)
+    if primary != "last":
+        save_session(settings, "last", messages)
+    return path
+
+
 def load_session(settings: Settings, name: str) -> list[dict]:
     path = session_path(settings, name)
     if not path.is_file():

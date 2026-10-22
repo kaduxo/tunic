@@ -16,12 +16,14 @@ import re
 from pathlib import Path
 from unittest.mock import patch
 
-from tunic.agent import compact_messages, run_turn, system_prompt
+from tunic.agent import compact_messages, execute_plan_prompt, run_turn, system_prompt
 from tunic.cli import main
-from tunic.config import LMSTUDIO_BASE_URL, ConfigError, resolve_settings, save_choice
+from tunic.config import LMSTUDIO_BASE_URL, ConfigError, ensure_home, resolve_settings, save_choice, save_yes
+from tunic.fetch import FetchError, public_https_url
 from tunic.keys import KeyMissing, key_status, resolve_key
-from tunic.providers import Completion, ProviderError, ToolCall, build_anthropic_payload, build_openai_payload
-from tunic.tools import builtin_tools, resolve_user_path, run_tool
+from tunic.providers import Completion, ProviderError, ToolCall, build_anthropic_payload, build_openai_payload, complete
+from tunic.session import list_sessions, load_session
+from tunic.tools import builtin_tools, resolve_user_path, run_tool, undo_last
 from tunic.ui import ActivityView
 
 
@@ -120,7 +122,7 @@ class PathTests(unittest.TestCase):
             wrote = run_tool("write_file", {"path": "sub/a.txt", "content": "hello"}, settings)
             self.assertIn("wrote", wrote)
             text = run_tool("read_file", {"path": "sub/a.txt"}, settings)
-            self.assertEqual(text, "hello")
+            self.assertEqual(text, "sub/a.txt:1:hello")
             listed = run_tool("list_dir", {"path": "sub"}, settings)
             self.assertIn("a.txt", listed)
 
@@ -168,7 +170,7 @@ class SerialTests(unittest.TestCase):
                 ToolCall(id="2", name="bash", arguments=raw[1]["function"]["arguments"], parsed={"command": "two"}),
             ]
 
-            def fake_complete(messages, tools, settings, key):
+            def fake_complete(messages, tools, settings, key, on_delta=None):
                 if any(m.get("role") == "tool" for m in messages):
                     return Completion(content="done")
                 return Completion(content="", tool_calls=calls, raw_tool_calls=raw)
@@ -209,6 +211,7 @@ class KeyTests(unittest.TestCase):
             ("openai", "OPENAI_API_KEY", "TUNIC_OPENAI_PASS"),
             ("xai", "XAI_API_KEY", "TUNIC_XAI_PASS"),
             ("anthropic", "ANTHROPIC_API_KEY", "TUNIC_ANTHROPIC_PASS"),
+            ("synthetic", "SYNTHETIC_API_KEY", "TUNIC_SYNTHETIC_PASS"),
         ]
         for provider, env_name, pass_env in cases:
             with self._cleared():
@@ -269,6 +272,21 @@ class KeyTests(unittest.TestCase):
                 resolve_key(settings, runner=runner)
         self.assertIn("missing/entry", str(caught.exception))
         self.assertNotIn("secret-from-pass-stderr", str(caught.exception))
+
+    def test_home_env_supplies_synthetic_key(self):
+        secret = "syn-do-not-print"
+        Path(self.home).mkdir(parents=True, exist_ok=True)
+        (Path(self.home) / "env").write_text(f"SYNTHETIC_API_KEY={secret}\n", encoding="utf-8")
+        with self._cleared():
+            import tunic.keys as keys
+
+            keys._HOME_ENV_LOADED = False
+            settings = _settings(provider="synthetic", model="hf:Qwen/Qwen3.8-27B", home=Path(self.home), cwd=self.home)
+            self.assertEqual(resolve_key(settings), secret)
+            status = key_status(settings)
+            self.assertIn("SYNTHETIC_API_KEY", status)
+            self.assertNotIn(secret, status)
+            keys._HOME_ENV_LOADED = False
 
     def test_local_needs_no_key(self):
         with self._cleared():
@@ -782,6 +800,184 @@ class ChoiceUnitTests(unittest.TestCase):
         self.assertIn(str(Path(tmp).resolve()), prompt)
         self.assertIn("Relative paths are inside this project", prompt)
 
+    def test_prompt_names_the_model_and_forbids_secret_hunting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _settings(
+                provider="synthetic",
+                model="hf:Qwen/Qwen3.8-27B",
+                home=Path(tmp),
+                cwd=tmp,
+            )
+            prompt = system_prompt(settings)
+        self.assertIn("provider: synthetic", prompt)
+        self.assertIn("model: hf:Qwen/Qwen3.8-27B", prompt)
+        self.assertIn("do not probe env", prompt)
+        self.assertIn("Stay ethical", prompt)
+        self.assertIn("API keys", prompt)
+        self.assertIn("list_dir", prompt)
+        self.assertIn("edit_file", prompt)
+        self.assertIn("/auto on", prompt)
+        self.assertIn("You cannot run them", prompt)
+        self.assertIn("auto: off", prompt)
+        self.assertIn("max tool steps this turn:", prompt)
+        self.assertIn("glob", prompt)
+        self.assertIn("fetch", prompt)
+        self.assertIn("git:", prompt)
+
+    def test_prompt_loads_a_matching_skill(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            skills = home / "skills"
+            skills.mkdir()
+            (skills / "search.md").write_text(
+                "---\nname: search\ndescription: Find text in the project files\n---\nUse search, not bash grep.\n",
+                encoding="utf-8",
+            )
+            (skills / "deploy.md").write_text("How to ship a release.\n", encoding="utf-8")
+            settings = _settings(provider="lmstudio", home=home, cwd=tmp)
+            loaded = system_prompt(settings, "search the repo for known-string")
+            skipped = system_prompt(settings, "say hello")
+        self.assertIn("Skill search", loaded)
+        self.assertIn("Use search, not bash grep.", loaded)
+        self.assertIn("deploy", loaded)
+        self.assertNotIn("How to ship a release.", loaded)
+        self.assertIn("search", skipped)
+        self.assertNotIn("Use search, not bash grep.", skipped)
+
+    def test_prompt_reflects_auto_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _settings(provider="lmstudio", yes=True, home=Path(tmp), cwd=tmp)
+            prompt = system_prompt(settings)
+        self.assertIn("auto: on", prompt)
+        self.assertIn("writes/bash: allowed without asking", prompt)
+
+    def test_later_turn_refreshes_the_session_card(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _settings(
+                provider="custom",
+                model="local-test",
+                base_url="http://127.0.0.1:9/v1",
+                yes=False,
+                home=Path(tmp),
+                cwd=tmp,
+            )
+            prior = [
+                {"role": "system", "content": "stale system"},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+            ]
+
+            def fake_complete(messages, tools, settings, key, on_delta=None):
+                self.assertEqual(messages[0]["role"], "system")
+                self.assertIn("auto: on", messages[0]["content"])
+                self.assertNotIn("stale system", messages[0]["content"])
+                return Completion(content="ok")
+
+            settings.yes = True
+            with patch("tunic.agent.complete", side_effect=fake_complete):
+                result = run_turn("next", settings, emit=lambda _line: None, prior=prior)
+        self.assertEqual(result.assistant, "ok")
+
+    def test_max_steps_asks_for_an_answer(self):
+        raw = json.dumps({"command": "echo ok"})
+        call = ToolCall(id="1", name="bash", arguments=raw, parsed={"command": "echo ok"})
+        raw_call = {"id": "1", "type": "function", "function": {"name": "bash", "arguments": raw}}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _settings(
+                provider="custom",
+                model="local-test",
+                base_url="http://127.0.0.1:9/v1",
+                yes=True,
+                max_steps=2,
+                home=Path(tmp),
+                cwd=tmp,
+            )
+
+            def fake_complete(messages, tools, settings, key, on_delta=None):
+                if any("no more tool steps" in str(m.get("content") or "") for m in messages):
+                    return Completion(content="here is what I found")
+                return Completion(content="", tool_calls=[call], raw_tool_calls=[raw_call])
+
+            lines = []
+            with patch("tunic.agent.complete", side_effect=fake_complete):
+                result = run_turn("go", settings, emit=lines.append)
+        self.assertEqual(result.assistant, "here is what I found")
+        self.assertEqual(result.tool_calls, 2)
+        self.assertIn("wrap", result.events)
+        self.assertTrue(any(line.startswith("wrap:") for line in lines))
+        self.assertNotIn("stopped: max steps", "\n".join(lines))
+        self.assertTrue(result.truncated)
+        self.assertTrue(any(line.startswith("step: 1/2") for line in lines))
+
+    def test_continue_runs_another_round(self):
+        raw = json.dumps({"command": "echo ok"})
+        call = ToolCall(id="1", name="bash", arguments=raw, parsed={"command": "echo ok"})
+        raw_call = {"id": "1", "type": "function", "function": {"name": "bash", "arguments": raw}}
+
+        def fake_complete(messages, tools, settings, key, on_delta=None):
+            texts = [str(m.get("content") or "") for m in messages]
+            if any("Continue the previous task" in text for text in texts):
+                return Completion(content="done after continue")
+            if any("no more tool steps" in text for text in texts):
+                return Completion(content="partial")
+            return Completion(content="", tool_calls=[call], raw_tool_calls=[raw_call])
+
+        def fetch(settings, timeout=15):
+            return [{"id": "already-loaded", "state": "loaded"}]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            with patch("tunic.agent.complete", side_effect=fake_complete):
+                code, out, err = SessionTests()._run(
+                    ["do work", "continue", "/exit"],
+                    home,
+                    home,
+                    fetch=fetch,
+                    extra_env={"OPENAI_API_KEY": "test-key"},
+                    argv=["--yes", "--provider", "custom", "--base-url", "http://127.0.0.1:9/v1", "--model", "m", "--max-steps", "1"],
+                )
+        self.assertEqual(code, 0, err)
+        self.assertIn("partial", out)
+        self.assertIn("type continue for another round", out)
+        self.assertIn("done after continue", out)
+
+    def test_cloud_default_steps_are_higher(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            local = resolve_settings(provider="lmstudio", home=Path(tmp), cwd=tmp)
+            cloud = resolve_settings(
+                provider="synthetic",
+                model="hf:Qwen/Qwen3.8-27B",
+                home=Path(tmp),
+                cwd=tmp,
+            )
+        self.assertEqual(local.max_steps, 16)
+        self.assertEqual(cloud.max_steps, 32)
+
+    def test_secret_files_are_denied_even_with_yes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            env_path = home / "env"
+            env_path.write_text("SYNTHETIC_API_KEY=secret-key\n", encoding="utf-8")
+            settings = _settings(provider="lmstudio", yes=True, home=home, cwd=tmp)
+            settings.home = home
+            denied_read = run_tool("read_file", {"path": str(env_path)}, settings)
+            denied_bash = run_tool(
+                "bash",
+                {"command": f"cat {env_path}"},
+                settings,
+            )
+            denied_proc = run_tool(
+                "bash",
+                {"command": "tr '\\0' '\\n' < /proc/self/environ"},
+                settings,
+            )
+        self.assertIn("permission denied", denied_read)
+        self.assertIn("permission denied", denied_bash)
+        self.assertIn("permission denied", denied_proc)
+        self.assertNotIn("secret-key", denied_read)
+        self.assertNotIn("secret-key", denied_bash)
+
 
 class ActivityViewTests(unittest.TestCase):
     def test_hides_transport_lines_and_names_the_step(self):
@@ -800,6 +996,7 @@ class ActivityViewTests(unittest.TestCase):
         self.assertEqual(shown[0], "→ read README.md")
         self.assertEqual(shown[1], "  hello (+1 lines)")
         self.assertEqual(shown[2:], ["", "done"])
+        self.assertEqual(ActivityView().feed("step: 3/16"), ["step 3/16"])
 
     def test_bash_and_write_stay_one_line(self):
         view = ActivityView()
@@ -848,6 +1045,7 @@ class HelpTests(unittest.TestCase):
             "--base-url",
             "--profile",
             "--yes",
+            "--ask",
             "--plan",
             "--cwd",
             "--session",
@@ -875,7 +1073,7 @@ class HelpTests(unittest.TestCase):
                 )
             saved = json.loads((home / "config.json").read_text(encoding="utf-8"))
         self.assertEqual(code, 0, err)
-        for label in ("ollama", "vllm", "openrouter", "groq", "custom URL", "grok / xAI"):
+        for label in ("ollama", "vllm", "openrouter", "groq", "custom URL", "grok / xAI", "synthetic"):
             self.assertIn(label, out)
         self.assertEqual(saved["provider"], "openrouter")
         self.assertEqual(saved["model"], "router-test")
@@ -934,7 +1132,7 @@ class ScreenTests(unittest.TestCase):
             )
         self.assertIn("plan: on", text)
         self.assertIn("writes: off (plan mode)", text)
-        self.assertNotIn("allowed (--yes)", text)
+        self.assertNotIn("writes: allowed", text)
         self.assertEqual(code, 0, err)
         self.assertIn("plan: on", out)
         self.assertIn("writes: off (plan mode)", out)
@@ -995,6 +1193,10 @@ class ScreenTests(unittest.TestCase):
         ):
             self.assertIn(line, inside)
         self.assertGreater(text.index("/help"), text.index("└"))
+        self.assertIn("├─ connection ", text)
+        self.assertIn("├─ session ", text)
+        self.assertEqual(text.count("┌"), 1)
+        self.assertEqual(text.count("└"), 1)
         from tunic.ui import format_slash_help, paint_block
 
         colored = paint_block(text, enabled=True)
@@ -1070,7 +1272,7 @@ class ScreenTests(unittest.TestCase):
         )
         raw_call = {"id": "1", "type": "function", "function": {"name": "write_file", "arguments": raw}}
 
-        def fake_complete(messages, tools, settings, key):
+        def fake_complete(messages, tools, settings, key, on_delta=None):
             if any(m.get("role") == "tool" for m in messages):
                 return Completion(content="did not write")
             return Completion(content="", tool_calls=[call], raw_tool_calls=[raw_call])
@@ -1109,7 +1311,7 @@ class ScreenTests(unittest.TestCase):
         )
         raw_call = {"id": "1", "type": "function", "function": {"name": "write_file", "arguments": raw}}
 
-        def fake_complete(messages, tools, settings, key):
+        def fake_complete(messages, tools, settings, key, on_delta=None):
             if any(m.get("role") == "tool" for m in messages):
                 return Completion(content="wrote it")
             return Completion(content="", tool_calls=[call], raw_tool_calls=[raw_call])
@@ -1133,12 +1335,106 @@ class ScreenTests(unittest.TestCase):
             self.assertEqual((home / "notes.txt").read_text(encoding="utf-8"), "ok")
             self.assertNotIn("test-key", out)
 
+    def test_saved_yes_runs_without_asking(self):
+        raw = json.dumps({"path": "notes.txt", "content": "ok"})
+        call = ToolCall(
+            id="1",
+            name="write_file",
+            arguments=raw,
+            parsed={"path": "notes.txt", "content": "ok"},
+        )
+        raw_call = {"id": "1", "type": "function", "function": {"name": "write_file", "arguments": raw}}
+
+        def fake_complete(messages, tools, settings, key, on_delta=None):
+            if any(m.get("role") == "tool" for m in messages):
+                return Completion(content="wrote it")
+            return Completion(content="", tool_calls=[call], raw_tool_calls=[raw_call])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            save_choice(home, provider="openai", model="gpt-test")
+            save_yes(home, True)
+            with patch("tunic.agent.complete", side_effect=fake_complete):
+                code, out, err = SessionTests()._run(
+                    ["write a note", "/exit"],
+                    home,
+                    home,
+                    extra_env={"OPENAI_API_KEY": "test-key"},
+                )
+            self.assertEqual(code, 0, err)
+            self.assertNotIn("Allow it?", out)
+            self.assertIn("writes: allowed", out)
+            self.assertEqual((home / "notes.txt").read_text(encoding="utf-8"), "ok")
+
+    def test_ask_overrides_saved_yes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            save_yes(home, True)
+            settings = resolve_settings(home=home, cwd=tmp, ask=True)
+            self.assertFalse(settings.yes)
+
+    def test_slash_yes_saves(self):
+        def fetch(settings, timeout=15):
+            return [{"id": "already-loaded", "state": "loaded"}]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            code, out, err = SessionTests()._run(
+                ["/yes", "/exit"],
+                home,
+                home,
+                fetch=fetch,
+            )
+            saved = json.loads((home / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(code, 0, err)
+        self.assertTrue(saved["yes"])
+        self.assertIn("writes: allowed", out)
+        self.assertIn("saved", out)
+
+    def test_slash_auto_on_and_off(self):
+        def fetch(settings, timeout=15):
+            return [{"id": "already-loaded", "state": "loaded"}]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            code, out, err = SessionTests()._run(
+                ["/auto on", "/auto", "/auto off", "/exit"],
+                home,
+                home,
+                fetch=fetch,
+            )
+            saved = json.loads((home / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(code, 0, err)
+        self.assertFalse(saved["yes"])
+        self.assertIn("auto: on", out)
+        self.assertIn("auto: off", out)
+        self.assertIn("usage: /auto on    /auto off", out)
+        self.assertLess(out.index("auto: on"), out.index("usage: /auto on    /auto off"))
+
+    def test_slash_steps_saves(self):
+        def fetch(settings, timeout=15):
+            return [{"id": "already-loaded", "state": "loaded"}]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            code, out, err = SessionTests()._run(
+                ["/steps 24", "/exit"],
+                home,
+                home,
+                fetch=fetch,
+            )
+            saved = json.loads((home / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(saved["max_steps"], 24)
+        self.assertIn("steps: 24", out)
+        self.assertIn("saved", out)
+
     def test_shell_asks_before_it_runs(self):
         raw = json.dumps({"command": "echo tunic-ok"})
         call = ToolCall(id="1", name="bash", arguments=raw, parsed={"command": "echo tunic-ok"})
         raw_call = {"id": "1", "type": "function", "function": {"name": "bash", "arguments": raw}}
 
-        def fake_complete(messages, tools, settings, key):
+        def fake_complete(messages, tools, settings, key, on_delta=None):
             if any(m.get("role") == "tool" for m in messages):
                 return Completion(content="did not run")
             return Completion(content="", tool_calls=[call], raw_tool_calls=[raw_call])
@@ -1191,6 +1487,11 @@ class ScreenTests(unittest.TestCase):
             cloud = json.loads((home / "config.json").read_text(encoding="utf-8"))
             self.assertEqual(cloud["base_url"], "https://api.openai.com/v1")
             self.assertNotIn("127.0.0.1:9", cloud["base_url"])
+            save_choice(home, provider="synthetic", model="hf:Qwen/Qwen3.8-27B")
+            syn = json.loads((home / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(syn["provider"], "synthetic")
+            self.assertEqual(syn["model"], "hf:Qwen/Qwen3.8-27B")
+            self.assertEqual(syn["base_url"], "https://api.synthetic.new/v1")
 
     def test_unknown_slash_is_not_sent_to_the_model(self):
         def fetch(settings, timeout=15):
@@ -1209,7 +1510,7 @@ class ScreenTests(unittest.TestCase):
         call = ToolCall(id="1", name="bash", arguments=raw, parsed={"command": "echo tunic-ok"})
         raw_call = {"id": "1", "type": "function", "function": {"name": "bash", "arguments": raw}}
 
-        def fake_complete(messages, tools, settings, key):
+        def fake_complete(messages, tools, settings, key, on_delta=None):
             if any(m.get("role") == "tool" for m in messages):
                 return Completion(content="tunic-ok")
             return Completion(content="", tool_calls=[call], raw_tool_calls=[raw_call])
@@ -1240,6 +1541,155 @@ class ScreenTests(unittest.TestCase):
         self.assertNotIn("┌", text)
         self.assertNotIn("└", text)
 
+    def test_settings_saves_synthetic_qwen(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            with patch("urllib.request.urlopen", side_effect=AssertionError("network")):
+                code, out, err = SessionTests()._run(
+                    ["/settings", "9", "", "", "/exit"],
+                    home,
+                    home,
+                    fetch=lambda settings, timeout=15: [{"id": "already-loaded", "state": "loaded"}],
+                )
+            saved = json.loads((home / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(code, 0, err)
+        self.assertIn("synthetic", out)
+        self.assertEqual(saved["provider"], "synthetic")
+        self.assertEqual(saved["model"], "hf:Qwen/Qwen3.8-27B")
+        self.assertEqual(saved["base_url"], "https://api.synthetic.new/v1")
+        self.assertNotIn("auth", saved)
+
+    def test_models_lists_synthetic_catalog(self):
+        payload = {
+            "data": [
+                {"id": "hf:zai-org/GLM-4.7-Flash"},
+                {"id": "hf:Qwen/Qwen3.8-27B"},
+                {"id": "syn:large:text"},
+            ]
+        }
+
+        class Response:
+            def read(self):
+                return json.dumps(payload).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def fake_urlopen(request, timeout=15):
+            self.assertIn("/models", request.full_url)
+            self.assertNotIn("secret-key", request.full_url)
+            return Response()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(
+                os.environ,
+                {
+                    "TUNIC_HOME": tmp,
+                    "HOME": tmp,
+                    "PATH": os.environ.get("PATH", ""),
+                    "SYNTHETIC_API_KEY": "secret-key",
+                },
+                clear=True,
+            ):
+                with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                    with redirect_stdout(io.StringIO()) as buf, redirect_stderr(io.StringIO()) as err:
+                        code = main(["--provider", "synthetic", "models"])
+        text = buf.getvalue()
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertIn("qwen3.8", text)
+        self.assertIn("hf:Qwen/Qwen3.8-27B", text)
+        self.assertIn("syn:large:text", text)
+        self.assertLess(text.index("qwen3.8"), text.index("hf:Qwen/Qwen3.8-27B"))
+        self.assertLess(text.index("hf:Qwen/Qwen3.8-27B"), text.index("hf:zai-org/GLM-4.7-Flash"))
+        self.assertNotIn("secret-key", text)
+
+    def test_model_slash_lists_and_saves(self):
+        catalog = {
+            "data": [
+                {"id": "hf:Qwen/Qwen3.8-27B"},
+                {"id": "syn:large:text"},
+            ]
+        }
+
+        class Response:
+            def read(self):
+                return json.dumps(catalog).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            save_choice(home, provider="synthetic", model="hf:Qwen/Qwen3.8-27B")
+            with patch("urllib.request.urlopen", return_value=Response()):
+                code, out, err = SessionTests()._run(
+                    ["/model", "3", "/exit"],
+                    home,
+                    home,
+                    extra_env={"SYNTHETIC_API_KEY": "secret-key"},
+                )
+            saved = json.loads((home / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(code, 0, err)
+        self.assertIn("qwen3.8", out)
+        self.assertIn("syn:large:text", out)
+        self.assertEqual(saved["provider"], "synthetic")
+        self.assertEqual(saved["model"], "syn:large:text")
+        self.assertNotIn("secret-key", out)
+
+    def test_model_slash_picks_local_qwen(self):
+        catalog = {"data": [{"id": "hf:Qwen/Qwen3.8-27B"}]}
+
+        class Response:
+            def read(self):
+                return json.dumps(catalog).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            save_choice(home, provider="synthetic", model="hf:Qwen/Qwen3.8-27B")
+            with patch("urllib.request.urlopen", return_value=Response()):
+                code, out, err = SessionTests()._run(
+                    ["/model", "1", "/exit"],
+                    home,
+                    home,
+                    extra_env={"SYNTHETIC_API_KEY": "secret-key"},
+                )
+            saved = json.loads((home / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(code, 0, err)
+        self.assertIn("qwen3.8", out)
+        self.assertEqual(saved["provider"], "lmstudio")
+        self.assertEqual(saved["model"], "qwen3.8")
+        self.assertEqual(saved["base_url"], "http://127.0.0.1:1234/v1")
+
+    def test_profile_switches_to_synthetic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            with patch.dict(os.environ, {"TUNIC_HOME": str(home), "HOME": str(home)}):
+                ensure_home()
+            save_choice(home, provider="lmstudio", model="local-qwen")
+            code, out, err = SessionTests()._run(
+                ["/profile", "/profile synthetic", "/exit"],
+                home,
+                home,
+                fetch=lambda settings, timeout=15: [{"id": "local-qwen", "state": "loaded"}],
+            )
+            saved = json.loads((home / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(code, 0, err)
+        self.assertIn("synthetic", out)
+        self.assertIn("hf:Qwen/Qwen3.8-27B", out)
+        self.assertEqual(saved["profiles"]["synthetic"]["provider"], "synthetic")
+
 
 class SpanSearchTests(unittest.TestCase):
     def test_search_returns_path_and_line_number(self):
@@ -1259,6 +1709,26 @@ class SpanSearchTests(unittest.TestCase):
         self.assertIn("known-string", found)
         self.assertNotIn("other.txt", found)
         self.assertNotIn(".git", found)
+
+    def test_search_regex_and_glob(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "keep.py").write_text("alpha_one\n", encoding="utf-8")
+            (root / "skip.txt").write_text("alpha_one\n", encoding="utf-8")
+            settings = _settings(provider="lmstudio", plan=True, home=root, cwd=tmp)
+            found = run_tool(
+                "search",
+                {"query": "alpha_[a-z]+", "path": ".", "regex": "true", "glob": "*.py"},
+                settings,
+            )
+            skipped = run_tool(
+                "search",
+                {"query": "alpha_[a-z]+", "path": ".", "glob": "*.py"},
+                settings,
+            )
+        self.assertIn("keep.py:1:", found)
+        self.assertNotIn("skip.txt", found)
+        self.assertEqual(skipped, "no matches")
 
     def test_edit_changes_one_line_and_leaves_the_rest(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1332,7 +1802,7 @@ class SpanSearchTests(unittest.TestCase):
             self.assertIs(payload["stream"], False)
             self.assertEqual(payload["tools"][0]["function"]["name"], "bash")
             names = [tool["function"]["name"] for tool in payload["tools"]]
-            for name in ("bash", "read_file", "write_file", "list_dir", "search", "edit_file"):
+            for name in ("bash", "read_file", "write_file", "list_dir", "search", "edit_file", "fetch"):
                 self.assertIn(name, names)
             with patch.dict(os.environ, env, clear=True):
                 short = resolve_settings(
@@ -1352,10 +1822,312 @@ class SpanSearchTests(unittest.TestCase):
             listed = run_tool("list_dir", {"path": "sub"}, settings)
             ran = run_tool("bash", {"command": "printf tunic-ok"}, settings)
         self.assertIn("wrote", wrote)
-        self.assertEqual(read, "hello")
+        self.assertEqual(read, "sub/a.txt:1:hello")
         self.assertIn("a.txt", listed)
         self.assertIn("tunic-ok", ran)
         self.assertIn("exit=0", ran)
+
+
+class HarnessTests(unittest.TestCase):
+    def test_read_file_is_numbered_and_can_span(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "notes.txt"
+            path.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+            settings = _settings(provider="lmstudio", home=Path(tmp), cwd=tmp)
+            whole = run_tool("read_file", {"path": "notes.txt"}, settings)
+            span = run_tool("read_file", {"path": "notes.txt", "start": "2", "end": "3"}, settings)
+        self.assertEqual(whole, "notes.txt:1:alpha\nnotes.txt:2:beta\nnotes.txt:3:gamma")
+        self.assertEqual(span, "notes.txt:2:beta\nnotes.txt:3:gamma")
+
+    def test_list_dir_marks_directories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pkg").mkdir()
+            (root / "readme.txt").write_text("x\n", encoding="utf-8")
+            settings = _settings(provider="lmstudio", home=root, cwd=tmp)
+            listed = run_tool("list_dir", {"path": "."}, settings)
+        self.assertIn("pkg/", listed)
+        self.assertIn("readme.txt", listed)
+        self.assertNotIn("readme.txt/", listed)
+
+    def test_write_shows_diff_and_undo_restores(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "notes.txt"
+            path.write_text("old\n", encoding="utf-8")
+            settings = _settings(provider="lmstudio", yes=True, home=Path(tmp), cwd=tmp)
+            wrote = run_tool("write_file", {"path": "notes.txt", "content": "new\n"}, settings)
+            self.assertIn("-old", wrote.replace(" ", ""))
+            self.assertIn("+new", wrote.replace(" ", ""))
+            self.assertEqual(path.read_text(encoding="utf-8"), "new\n")
+            undone = undo_last(settings)
+            self.assertIn("restored", undone)
+            self.assertEqual(path.read_text(encoding="utf-8"), "old\n")
+
+    def test_fetch_refuses_private_urls(self):
+        with self.assertRaises(FetchError):
+            public_https_url("http://example.com")
+        with self.assertRaises(FetchError):
+            public_https_url("https://127.0.0.1/")
+        with self.assertRaises(FetchError):
+            public_https_url("https://localhost/secret")
+        with self.assertRaises(FetchError):
+            public_https_url("https://192.168.1.10/x")
+        with self.assertRaises(FetchError):
+            public_https_url("https://169.254.169.254/latest")
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _settings(provider="lmstudio", plan=True, home=Path(tmp), cwd=tmp)
+            denied = run_tool("fetch", {"url": "https://127.0.0.1/"}, settings)
+        self.assertIn("tool error", denied)
+        self.assertIn("public", denied.lower() + denied)
+
+    def test_fetch_strips_html(self):
+        class Resp:
+            headers = {"Content-Type": "text/html"}
+
+            def read(self, n=-1):
+                data = b"<html><body><h1>Hello</h1><script>secret()</script><p>World</p></body></html>"
+                if n is None or n < 0:
+                    return data
+                return data[:n]
+
+            def geturl(self):
+                return "https://example.org/page"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        class Opener:
+            def open(self, req, timeout=15):
+                return Resp()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _settings(provider="lmstudio", plan=True, home=Path(tmp), cwd=tmp)
+            with patch("tunic.fetch._host_blocked", return_value=False):
+                with patch("urllib.request.build_opener", return_value=Opener()):
+                    text = run_tool("fetch", {"url": "https://example.org/page"}, settings)
+        self.assertIn("Hello", text)
+        self.assertIn("World", text)
+        self.assertNotIn("secret()", text)
+
+    def test_git_card_names_the_branch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess = __import__("subprocess")
+            env = {key: value for key, value in os.environ.items() if key not in {"GIT_DIR", "GIT_WORK_TREE"}}
+            env["GIT_TERMINAL_PROMPT"] = "0"
+            created = subprocess.run(
+                ["git", "init", "-b", "tunic-test"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            if created.returncode != 0:
+                subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True, env=env)
+                subprocess.run(
+                    ["git", "symbolic-ref", "HEAD", "refs/heads/tunic-test"],
+                    cwd=root,
+                    check=True,
+                    capture_output=True,
+                    env=env,
+                )
+            self.assertTrue((root / ".git").exists(), created.stderr)
+            (root / "dirty.txt").write_text("x\n", encoding="utf-8")
+            settings = _settings(provider="lmstudio", home=root, cwd=str(root))
+            prompt = system_prompt(settings)
+        self.assertIn("git: tunic-test", prompt)
+        self.assertIn("dirty", prompt)
+        self.assertIn("dirty.txt", prompt)
+
+    def test_interrupt_keeps_the_conversation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _settings(
+                provider="custom",
+                model="local-test",
+                base_url="http://127.0.0.1:9/v1",
+                home=Path(tmp),
+                cwd=tmp,
+            )
+
+            def boom(*args, **kwargs):
+                raise KeyboardInterrupt
+
+            with patch("tunic.agent.complete", side_effect=boom):
+                result = run_turn("go", settings, emit=lambda _line: None)
+        self.assertTrue(result.truncated)
+        self.assertEqual(result.reason, "interrupt")
+        self.assertTrue(result.messages)
+        self.assertIn("stopped", result.assistant)
+
+    def test_slash_go_executes_the_plan(self):
+        seen = []
+
+        def fetch(settings, timeout=15):
+            return [{"id": "already-loaded", "state": "loaded"}]
+
+        def fake_turn(prompt, settings, emit, ask=None, prior=None, on_delta=None):
+            seen.append((prompt, settings.plan))
+            emit("assistant: ran the plan")
+            from tunic.agent import TurnResult
+
+            return TurnResult(messages=[{"role": "user", "content": "plan it"}, {"role": "assistant", "content": "1. do it"}], assistant="ran the plan")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            with patch("tunic.cli.run_turn", side_effect=fake_turn):
+                code, out, err = SessionTests()._run(
+                    ["first", "/plan", "/go", "/exit"],
+                    home,
+                    home,
+                    fetch=fetch,
+                )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(seen[0][0], "first")
+        self.assertIn("Execute the plan", seen[1][0])
+        self.assertFalse(seen[1][1])
+        self.assertIn(execute_plan_prompt()[:20], seen[1][0])
+
+    def test_sessions_auto_save_last(self):
+        def fetch(settings, timeout=15):
+            return [{"id": "already-loaded", "state": "loaded"}]
+
+        def fake_turn(prompt, settings, emit, ask=None, prior=None, on_delta=None):
+            emit("assistant: ok")
+            from tunic.agent import TurnResult
+
+            return TurnResult(
+                messages=[{"role": "user", "content": prompt}, {"role": "assistant", "content": "ok"}],
+                assistant="ok",
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            with patch("tunic.cli.run_turn", side_effect=fake_turn):
+                code, out, err = SessionTests()._run(["hello there", "/sessions", "/exit"], home, home, fetch=fetch)
+            names = list_sessions(_settings(provider="lmstudio", home=home, cwd=tmp))
+            loaded = load_session(_settings(provider="lmstudio", home=home, cwd=tmp), "last")
+        self.assertEqual(code, 0, err)
+        self.assertIn("last", names)
+        self.assertIn("session: last", out)
+        self.assertTrue(any(m.get("content") == "hello there" for m in loaded))
+
+    def test_skill_slash_lists_and_prints(self):
+        def fetch(settings, timeout=15):
+            return [{"id": "already-loaded", "state": "loaded"}]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            skills = home / "skills"
+            skills.mkdir()
+            (skills / "search.md").write_text("Use search, not bash grep.\n", encoding="utf-8")
+            code, out, err = SessionTests()._run(["/skill", "/skill search", "/exit"], home, home, fetch=fetch)
+        self.assertEqual(code, 0, err)
+        self.assertIn("skill: search", out)
+        self.assertIn("Use search, not bash grep.", out)
+
+    def test_retries_one_502_then_succeeds(self):
+        hits = {"n": 0}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                self.rfile.read(length)
+                hits["n"] += 1
+                if hits["n"] == 1:
+                    self.send_response(502)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                raw = json.dumps({"choices": [{"message": {"role": "assistant", "content": "after-retry"}}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, format, *args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        port = server.server_address[1]
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                settings = _settings(
+                    provider="custom",
+                    model="local-test",
+                    base_url=f"http://127.0.0.1:{port}/v1",
+                    home=Path(tmp),
+                    cwd=tmp,
+                )
+                result = run_turn("hi", settings, emit=lambda _line: None)
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual(hits["n"], 2)
+        self.assertEqual(result.assistant, "after-retry")
+
+    def test_cloud_streams_answer_deltas(self):
+        chunks = []
+        streamed = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                body = json.loads(self.rfile.read(length))
+                streamed.append(body.get("stream"))
+                payload = (
+                    b'data: {"choices":[{"delta":{"content":"hel"}}]}\n\n'
+                    b'data: {"choices":[{"delta":{"content":"lo"}}]}\n\n'
+                    b"data: [DONE]\n\n"
+                )
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, format, *args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        port = server.server_address[1]
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                settings = _settings(
+                    provider="openai",
+                    model="gpt-test",
+                    base_url=f"http://127.0.0.1:{port}/v1",
+                    home=Path(tmp),
+                    cwd=tmp,
+                )
+                with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
+                    completion = complete(
+                        [{"role": "user", "content": "hi"}],
+                        [],
+                        settings,
+                        "test-key",
+                        on_delta=chunks.append,
+                    )
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual(streamed, [True])
+        self.assertEqual(completion.content, "hello")
+        self.assertEqual(chunks, ["hel", "lo"])
+
+    def test_activity_view_shows_write_diff(self):
+        view = ActivityView()
+        view.feed('tool-call id=1 name=write_file arguments={"path": "a.txt"}')
+        view.feed("tool-result: write_file")
+        shown = view.feed("wrote a.txt (3 chars)\n--- a.txt\n+++ a.txt\n-old\n+new")
+        self.assertEqual(shown, ["  -old", "  +new"])
 
 
 if __name__ == "__main__":

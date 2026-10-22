@@ -5,7 +5,39 @@ from __future__ import annotations
 import os
 import subprocess
 
-from tunic.config import PROVIDERS, ConfigError, Settings
+from tunic.config import PROVIDERS, ConfigError, Settings, tunic_home
+
+_HOME_ENV_LOADED = False
+
+
+def load_home_env() -> None:
+    """Load key env vars from ~/.tunic/env when they are not already set.
+
+    The file is local-only. Values are never logged.
+    """
+    global _HOME_ENV_LOADED
+    if _HOME_ENV_LOADED:
+        return
+    _HOME_ENV_LOADED = True
+    path = tunic_home() / "env"
+    if not path.is_file():
+        return
+    allowed = {spec[key] for spec in PROVIDERS.values() for key in ("env", "pass_env") if spec.get(key)}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        name, _, value = line.partition("=")
+        name = name.strip()
+        value = value.strip().strip("'").strip('"')
+        if name in allowed and value and not os.environ.get(name, "").strip():
+            os.environ[name] = value
 
 
 class KeyMissing(ConfigError):
@@ -60,6 +92,7 @@ def resolve_key(settings: Settings, runner=None, account_resolver=None) -> str |
     and must not forward a cloud key to a LAN server.
     """
     _ = account_resolver
+    load_home_env()
     if not settings.needs_key:
         return None
     spec = settings.spec
@@ -82,6 +115,7 @@ def resolve_key(settings: Settings, runner=None, account_resolver=None) -> str |
 
 def key_status(settings: Settings) -> str:
     """Human status that never includes the secret or a pass file's contents."""
+    load_home_env()
     if not settings.needs_key:
         return f"{settings.provider}: no key required"
     spec = settings.spec

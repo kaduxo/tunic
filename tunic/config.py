@@ -14,8 +14,15 @@ LMSTUDIO_BASE_URL = "http://127.0.0.1:1234/v1"
 
 # A 1024-token reply cannot hold a real edit. This is the unset default only.
 DEFAULT_MAX_TOKENS = 4096
+DEFAULT_MAX_STEPS = 16
+CLOUD_MAX_STEPS = 32
+MAX_STEPS_CAP = 64
 
 LOCAL_PROVIDERS = frozenset({"lmstudio", "ollama", "vllm", "custom"})
+
+SYNTHETIC_BASE_URL = "https://api.synthetic.new/v1"
+DEFAULT_SYNTHETIC_MODEL = "hf:Qwen/Qwen3.8-27B"
+DEFAULT_LOCAL_MODEL = "qwen3.8"
 
 # kind, default base url, whether a cloud key is required, env var, pass-name env var
 PROVIDERS = {
@@ -75,6 +82,13 @@ PROVIDERS = {
         "env": "GROQ_API_KEY",
         "pass_env": "TUNIC_GROQ_PASS",
     },
+    "synthetic": {
+        "kind": "openai",
+        "base_url": SYNTHETIC_BASE_URL,
+        "needs_key": True,
+        "env": "SYNTHETIC_API_KEY",
+        "pass_env": "TUNIC_SYNTHETIC_PASS",
+    },
     "custom": {
         "kind": "openai",
         "base_url": "",
@@ -94,7 +108,7 @@ class Settings:
     provider: str = "lmstudio"
     model: str = ""
     base_url: str = LMSTUDIO_BASE_URL
-    max_steps: int = 8
+    max_steps: int = DEFAULT_MAX_STEPS
     max_tokens: int = DEFAULT_MAX_TOKENS
     temperature: float = 0.2
     yes: bool = False
@@ -108,6 +122,7 @@ class Settings:
     profile: str | None = None
     home: Path = field(default_factory=lambda: Path.home() / ".tunic")
     http_timeout: float = 180.0
+    undo: list = field(default_factory=list)
 
     @property
     def spec(self) -> dict:
@@ -141,8 +156,8 @@ def config_path() -> Path:
     return tunic_home() / "config.json"
 
 
-def load_config_file() -> dict:
-    path = config_path()
+def load_config_file(home: Path | None = None) -> dict:
+    path = (home or tunic_home()) / "config.json"
     if not path.is_file():
         return {}
     try:
@@ -187,7 +202,16 @@ def ensure_home() -> Path:
                     "model": "",
                     "base_url": LMSTUDIO_BASE_URL,
                     "profiles": {
-                        "local": {"provider": "lmstudio", "base_url": LMSTUDIO_BASE_URL},
+                        "local": {
+                            "provider": "lmstudio",
+                            "base_url": LMSTUDIO_BASE_URL,
+                            "model": DEFAULT_LOCAL_MODEL,
+                        },
+                        "synthetic": {
+                            "provider": "synthetic",
+                            "model": DEFAULT_SYNTHETIC_MODEL,
+                            "base_url": SYNTHETIC_BASE_URL,
+                        },
                         "openai": {"provider": "openai", "pass": ""},
                         "xai": {"provider": "xai", "pass": ""},
                         "anthropic": {"provider": "anthropic", "pass": ""},
@@ -235,6 +259,7 @@ def resolve_settings(
     base_url: str | None = None,
     profile: str | None = None,
     yes: bool = False,
+    ask: bool = False,
     plan: bool = False,
     cwd: str | None = None,
     session: str | None = None,
@@ -245,7 +270,7 @@ def resolve_settings(
     temperature: float | None = None,
     home: Path | None = None,
 ) -> Settings:
-    file_cfg = load_config_file()
+    file_cfg = load_config_file(home)
     chosen_profile = profile or os.environ.get("TUNIC_PROFILE") or ""
     profile_cfg = {}
     if chosen_profile:
@@ -295,13 +320,19 @@ def resolve_settings(
     if not work.is_dir():
         raise ConfigError(f"cwd is not a directory: {work}")
 
-    steps = max_steps if max_steps is not None else int(merged("max_steps") or 8)
+    steps = max_steps if max_steps is not None else int(merged("max_steps") or default_max_steps(name))
     tokens = max_tokens if max_tokens is not None else int(merged("max_tokens") or DEFAULT_MAX_TOKENS)
     temp = temperature if temperature is not None else float(merged("temperature") or 0.2)
-    if steps < 1:
-        raise ConfigError("--max-steps must be >= 1")
+    if steps < 1 or steps > MAX_STEPS_CAP:
+        raise ConfigError(f"--max-steps must be between 1 and {MAX_STEPS_CAP}")
     if tokens < 1:
         raise ConfigError("--max-tokens must be >= 1")
+    if ask:
+        yes_value = False
+    elif yes:
+        yes_value = True
+    else:
+        yes_value = _flag(os.environ.get("TUNIC_YES")) or _flag(merged("yes"))
 
     return Settings(
         provider=name,
@@ -310,7 +341,7 @@ def resolve_settings(
         max_steps=steps,
         max_tokens=tokens,
         temperature=temp,
-        yes=yes,
+        yes=yes_value,
         plan=plan,
         cwd=work.resolve(),
         session=session,
@@ -329,6 +360,61 @@ def _stdout_is_tty() -> bool:
         return os.isatty(1)
     except OSError:
         return False
+
+
+def default_max_steps(provider: str) -> int:
+    if provider in LOCAL_PROVIDERS:
+        return DEFAULT_MAX_STEPS
+    return CLOUD_MAX_STEPS
+
+
+def _flag(value) -> bool:
+    if value is True:
+        return True
+    if value is False or value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def save_max_steps(home: Path, max_steps: int) -> None:
+    if max_steps < 1 or max_steps > MAX_STEPS_CAP:
+        raise ConfigError(f"max steps must be between 1 and {MAX_STEPS_CAP}")
+    home.mkdir(parents=True, exist_ok=True)
+    path = home / "config.json"
+    data: dict = {}
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ConfigError(f"config is not JSON: {path}") from exc
+        if not isinstance(loaded, dict):
+            raise ConfigError(f"config must be a JSON object: {path}")
+        data = loaded
+    data["max_steps"] = int(max_steps)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def save_yes(home: Path, yes: bool) -> None:
+    """Persist whether mutating tools run without asking. No secrets."""
+    home.mkdir(parents=True, exist_ok=True)
+    path = home / "config.json"
+    data: dict = {}
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ConfigError(f"config is not JSON: {path}") from exc
+        if not isinstance(loaded, dict):
+            raise ConfigError(f"config must be a JSON object: {path}")
+        data = loaded
+    data["yes"] = bool(yes)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
 
 
 def origin_of(base_url: str) -> str:
@@ -366,6 +452,7 @@ def save_choice(
     pass_name: str | None = None,
     auth: str | None = None,
     base_url: str | None = None,
+    profile: str | None = None,
 ) -> None:
     """Write the user default. Never write a key or a token.
 
@@ -428,6 +515,23 @@ def save_choice(
     else:
         data.pop("pass", None)
     data.pop("auth", None)
+    if profile:
+        profiles = data.get("profiles")
+        if not isinstance(profiles, dict):
+            profiles = {}
+            data["profiles"] = profiles
+        entry = profiles.get(profile)
+        if not isinstance(entry, dict):
+            entry = {}
+            profiles[profile] = entry
+        entry["provider"] = provider
+        entry["model"] = model_value
+        entry["base_url"] = data["base_url"]
+        if pass_value and PROVIDERS[provider]["needs_key"]:
+            entry["pass"] = pass_value
+        else:
+            entry.pop("pass", None)
+        entry.pop("auth", None)
     text = json.dumps(data, indent=2) + "\n"
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(text, encoding="utf-8")

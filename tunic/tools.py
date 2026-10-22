@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
+import difflib
+import fnmatch
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 from tunic.config import Settings
+from tunic.fetch import FetchError, get_public
 
 
 OUTPUT_CAP = 8000
-_READ_ONLY = frozenset({"read_file", "list_dir", "search"})
+_READ_ONLY = frozenset({"read_file", "list_dir", "search", "fetch"})
+_UNDO_CAP = 20
+_DIFF_LINES = 16
 _SKIP_DIRS = frozenset({".git", "__pycache__", ".venv", "node_modules", ".hg"})
 _MAX_MATCHES = 40
 _MAX_FILES = 2000
@@ -66,7 +72,7 @@ def builtin_tools() -> list[Tool]:
     return [
         Tool(
             name="bash",
-            description="Run a shell command and return stdout, stderr, and the exit code.",
+            description="Run a shell command in the project directory. Use for commands, not to read files or discover the model.",
             schema=_object(
                 {
                     "command": {
@@ -79,20 +85,28 @@ def builtin_tools() -> list[Tool]:
         ),
         Tool(
             name="read_file",
-            description="Read a text file. Relative paths and ~ are allowed.",
+            description="Read a text file as path:line:text. Optional start and end line numbers. Prefer this over bash cat.",
             schema=_object(
                 {
                     "path": {
                         "type": "string",
                         "description": "File path. Relative paths and ~ are allowed.",
-                    }
+                    },
+                    "start": {
+                        "type": "string",
+                        "description": "First line to return, 1-based. Omit to start at line 1.",
+                    },
+                    "end": {
+                        "type": "string",
+                        "description": "Last line to return, 1-based. Omit to read until the cap.",
+                    },
                 },
                 ["path"],
             ),
         ),
         Tool(
             name="write_file",
-            description="Write a whole text file, creating parent directories. Relative paths and ~ are allowed.",
+            description="Create or replace a whole text file. For a small change, use search then edit_file instead.",
             schema=_object(
                 {
                     "path": {
@@ -109,7 +123,7 @@ def builtin_tools() -> list[Tool]:
         ),
         Tool(
             name="edit_file",
-            description="Replace one line span. Other lines stay unchanged. Not a full-file rewrite.",
+            description="Replace one line span from search. Other lines stay. Not a full-file rewrite.",
             schema=_object(
                 {
                     "path": {
@@ -134,7 +148,7 @@ def builtin_tools() -> list[Tool]:
         ),
         Tool(
             name="list_dir",
-            description="List entries in a directory. Relative paths and ~ are allowed.",
+            description="List entries in a directory. Use path . for the working directory. Prefer this over bash ls.",
             schema=_object(
                 {
                     "path": {
@@ -147,19 +161,40 @@ def builtin_tools() -> list[Tool]:
         ),
         Tool(
             name="search",
-            description="Search file contents for a literal string. Returns each match as path and line number.",
+            description="Find text in files. Literal by default. Optional regex and glob. Returns path:line for edit_file. Prefer this over bash grep.",
             schema=_object(
                 {
                     "query": {
                         "type": "string",
-                        "description": "Literal string to find. Not a regular expression.",
+                        "description": "Text to find. Literal unless regex is true.",
                     },
                     "path": {
                         "type": "string",
                         "description": "File or directory. Use . for the working directory.",
                     },
+                    "regex": {
+                        "type": "string",
+                        "description": "true to treat query as a regular expression.",
+                    },
+                    "glob": {
+                        "type": "string",
+                        "description": "Optional filename glob such as *.py.",
+                    },
                 },
                 ["query", "path"],
+            ),
+        ),
+        Tool(
+            name="fetch",
+            description="GET a public https page as text. HTML is stripped. Local, private, and credentialed URLs are refused.",
+            schema=_object(
+                {
+                    "url": {
+                        "type": "string",
+                        "description": "Public https URL. No localhost or private addresses.",
+                    }
+                },
+                ["url"],
             ),
         ),
     ]
@@ -212,6 +247,9 @@ def run_tool(name: str, arguments: dict | None, settings: Settings, ask=None) ->
         return denied
     if not isinstance(arguments, dict):
         return f"tool error: {name} arguments were not a JSON object"
+    secret = _secret_denied(name, arguments, settings)
+    if secret:
+        return secret
     try:
         if name == "bash":
             return _bash(arguments, settings)
@@ -225,11 +263,54 @@ def run_tool(name: str, arguments: dict | None, settings: Settings, ask=None) ->
             return _list(arguments, settings)
         if name == "search":
             return _search(arguments, settings)
+        if name == "fetch":
+            return _fetch(arguments)
     except ValueError as exc:
         return f"tool error: {exc}"
     except OSError as exc:
         return f"tool error: {exc.strerror or exc}"
     return f"tool error: unknown tool {name}"
+
+
+def _secret_denied(name: str, arguments: dict, settings: Settings) -> str | None:
+    """Block secret files even when auto mode would otherwise allow the tool."""
+    env_file = (settings.home / "env").resolve()
+    if name == "bash":
+        command = arguments.get("command")
+        if isinstance(command, str) and _secret_command(command, env_file):
+            return "permission denied: process environment and API key files are off limits"
+        return None
+    raw = arguments.get("path")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        path = resolve_user_path(raw, settings.cwd)
+    except ValueError:
+        return None
+    if _secret_path(path, env_file):
+        return "permission denied: process environment and API key files are off limits"
+    return None
+
+
+def _secret_command(command: str, env_file: Path) -> bool:
+    text = command.lower().replace("'", "").replace('"', "")
+    if "/proc/" in text and "environ" in text:
+        return True
+    if "/.tunic/env" in text or "~/.tunic/env" in text:
+        return True
+    if str(env_file).lower() in text:
+        return True
+    return False
+
+
+def _secret_path(path: Path, env_file: Path) -> bool:
+    resolved = path.resolve()
+    if resolved == env_file:
+        return True
+    parts = resolved.parts
+    if resolved.name == "environ" and "proc" in parts:
+        return True
+    return resolved.name == "env" and ".tunic" in parts
 
 
 def _bash(arguments: dict, settings: Settings) -> str:
@@ -264,7 +345,29 @@ def _read(arguments: dict, settings: Settings) -> str:
     if b"\x00" in data[:8192]:
         return f"tool error: {path} looks binary"
     text = data.decode("utf-8", errors="replace")
-    return _cap(text)
+    lines = text.splitlines()
+    if not lines:
+        return f"{_display_path(path, settings.cwd)}:1:"
+    start = _optional_line(arguments.get("start"), "start")
+    end = _optional_line(arguments.get("end"), "end")
+    if start is None:
+        start = 1
+    if end is None:
+        end = len(lines)
+    if start > len(lines):
+        return f"tool error: line {start} is outside {path} ({len(lines)} lines)"
+    if end < start:
+        return "tool error: end is before start"
+    end = min(end, len(lines))
+    display = _display_path(path, settings.cwd)
+    numbered = [f"{display}:{number}:{lines[number - 1]}" for number in range(start, end + 1)]
+    return _cap("\n".join(numbered))
+
+
+def _optional_line(value, label: str) -> int | None:
+    if value in (None, ""):
+        return None
+    return _line_number(value, label)
 
 
 def _write(arguments: dict, settings: Settings) -> str:
@@ -272,16 +375,25 @@ def _write(arguments: dict, settings: Settings) -> str:
     content = arguments.get("content")
     if not isinstance(content, str):
         return "tool error: write_file requires content as a string"
+    before = _file_text(path)
+    _remember(settings, path, before)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
-    return f"wrote {path} ({len(content)} chars)"
+    diff = _short_diff(before or "", content, _display_path(path, settings.cwd))
+    summary = f"wrote {path} ({len(content)} chars)"
+    return summary if not diff else summary + "\n" + diff
 
 
 def _list(arguments: dict, settings: Settings) -> str:
     path = resolve_user_path(str(arguments.get("path", "")), settings.cwd)
     if not path.is_dir():
         return f"tool error: not a directory: {path}"
-    names = sorted(entry.name for entry in path.iterdir())
+    names = []
+    for entry in sorted(path.iterdir(), key=lambda item: item.name):
+        name = entry.name
+        if entry.is_dir():
+            name += "/"
+        names.append(name)
     if len(names) > 200:
         shown = names[:200]
         return "\n".join(shown) + f"\n[{len(names) - 200} more]"
@@ -353,8 +465,76 @@ def _edit(arguments: dict, settings: Settings) -> str:
         return f"tool error: line {start}-{end} is outside {path} ({len(lines)} lines)"
     # Splice the span. Lines outside it are copied, not rewritten by the model.
     new_lines = lines[: start - 1] + _replacement_lines(content) + lines[end:]
-    path.write_text("".join(new_lines), encoding="utf-8")
-    return f"edited {path} lines {start}-{end}"
+    after = "".join(new_lines)
+    _remember(settings, path, text)
+    path.write_text(after, encoding="utf-8")
+    diff = _short_diff(text, after, _display_path(path, settings.cwd))
+    summary = f"edited {path} lines {start}-{end}"
+    return summary if not diff else summary + "\n" + diff
+
+
+def _file_text(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if b"\x00" in data[:8192]:
+        return None
+    return data.decode("utf-8", errors="replace")
+
+
+def _remember(settings: Settings, path: Path, previous: str | None) -> None:
+    settings.undo.append({"path": str(path), "previous": previous})
+    if len(settings.undo) > _UNDO_CAP:
+        settings.undo = settings.undo[-_UNDO_CAP:]
+
+
+def undo_last(settings: Settings) -> str:
+    if not settings.undo:
+        return "nothing to undo"
+    item = settings.undo.pop()
+    path = Path(item["path"])
+    previous = item["previous"]
+    if previous is None:
+        if path.is_file():
+            path.unlink()
+            return f"removed {path} (was new)"
+        return f"already missing: {path}"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(previous, encoding="utf-8")
+    return f"restored {path}"
+
+
+def _short_diff(before: str, after: str, label: str) -> str:
+    rows = list(
+        difflib.unified_diff(
+            before.splitlines(),
+            after.splitlines(),
+            fromfile=label,
+            tofile=label,
+            lineterm="",
+        )
+    )
+    if not rows:
+        return ""
+    if len(rows) > _DIFF_LINES:
+        rows = rows[:_DIFF_LINES] + ["..."]
+    return "\n".join(rows)
+
+
+def _fetch(arguments: dict) -> str:
+    url = arguments.get("url")
+    if not isinstance(url, str) or not url.strip():
+        return "tool error: fetch requires a url string"
+    try:
+        text = get_public(url)
+    except FetchError as exc:
+        return f"tool error: {exc}"
+    if not text.strip():
+        return "fetch: empty page"
+    return _cap(text)
 
 
 def _display_path(path: Path, cwd: Path) -> str:
@@ -366,7 +546,7 @@ def _display_path(path: Path, cwd: Path) -> str:
     return text or path.name
 
 
-def _search_file(path: Path, query: str, cwd: Path, limit: int) -> tuple[list[str], bool]:
+def _search_file(path: Path, match, cwd: Path, limit: int) -> tuple[list[str], bool]:
     try:
         if not path.is_file():
             return [], False
@@ -384,7 +564,7 @@ def _search_file(path: Path, query: str, cwd: Path, limit: int) -> tuple[list[st
     shown: list[str] = []
     display = _display_path(path, cwd)
     for number, line in enumerate(text.splitlines(), start=1):
-        if query not in line:
+        if not match(line):
             continue
         preview = line if len(line) <= 200 else line[:200] + "…"
         if len(shown) >= limit:
@@ -403,6 +583,26 @@ def _iter_files(root: Path):
             yield Path(dirpath) / name
 
 
+def _truthy(value) -> bool:
+    if value is True:
+        return True
+    if value is False or value is None or value == "":
+        return False
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _glob_ok(path: Path, cwd: Path, glob: str) -> bool:
+    if not glob or glob in (".", "*"):
+        return True
+    rel = _display_path(path, cwd)
+    if fnmatch.fnmatch(path.name, glob) or fnmatch.fnmatch(rel, glob):
+        return True
+    try:
+        return path.relative_to(cwd.resolve()).match(glob)
+    except (ValueError, OSError):
+        return False
+
+
 def _search(arguments: dict, settings: Settings) -> str:
     query = arguments.get("query")
     if not isinstance(query, str) or query == "":
@@ -414,6 +614,24 @@ def _search(arguments: dict, settings: Settings) -> str:
         raw = "."
     if not isinstance(raw, str):
         return "tool error: search path must be a string"
+    glob = arguments.get("glob") or ""
+    if glob is None:
+        glob = ""
+    if not isinstance(glob, str):
+        return "tool error: search glob must be a string"
+    if _truthy(arguments.get("regex")):
+        try:
+            pattern = re.compile(query)
+        except re.error as exc:
+            return f"tool error: invalid regex: {exc}"
+
+        def match(line: str) -> bool:
+            return pattern.search(line) is not None
+    else:
+
+        def match(line: str) -> bool:
+            return query in line
+
     root = resolve_user_path(raw, settings.cwd)
     if not root.exists():
         return f"tool error: not found: {root}"
@@ -429,7 +647,9 @@ def _search(arguments: dict, settings: Settings) -> str:
         if seen > _MAX_FILES:
             truncated = True
             break
-        found, hit = _search_file(file_path, query, settings.cwd, _MAX_MATCHES - len(matches))
+        if glob and not _glob_ok(file_path, settings.cwd, glob):
+            continue
+        found, hit = _search_file(file_path, match, settings.cwd, _MAX_MATCHES - len(matches))
         matches.extend(found)
         if hit or len(matches) >= _MAX_MATCHES:
             truncated = True

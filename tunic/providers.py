@@ -11,6 +11,8 @@ from urllib.parse import urlparse
 from tunic.config import ConfigError, Settings, origin_of
 from tunic.tools import Tool
 
+_TRANSIENT_HTTP = frozenset({502, 503, 504})
+
 
 class ProviderError(Exception):
     """The model endpoint failed. The message must not include a key."""
@@ -154,28 +156,40 @@ def bearer_token(settings: Settings, key: str | None) -> str:
     return key
 
 
-def complete(messages: list[dict], tools: list[Tool], settings: Settings, key: str | None) -> Completion:
+def complete(
+    messages: list[dict],
+    tools: list[Tool],
+    settings: Settings,
+    key: str | None,
+    on_delta=None,
+) -> Completion:
     if not settings.model:
         raise ProviderError("no model selected")
     if settings.kind == "anthropic":
         return _complete_anthropic(messages, tools, settings, key)
-    return _complete_openai(messages, tools, settings, key)
+    return _complete_openai(messages, tools, settings, key, on_delta=on_delta)
 
 
-def _complete_openai(messages: list[dict], tools: list[Tool], settings: Settings, key: str | None) -> Completion:
+def _complete_openai(
+    messages: list[dict],
+    tools: list[Tool],
+    settings: Settings,
+    key: str | None,
+    on_delta=None,
+) -> Completion:
     payload = build_openai_payload(messages, tools, settings)
-    if payload.get("stream") is not False:
+    stream = bool(on_delta) and not settings.local
+    payload["stream"] = stream
+    if settings.local and payload.get("stream"):
         raise ProviderError("refusing to stream; local tool-calls hang when streamed")
     url = settings.base_url.rstrip("/") + "/chat/completions"
-    body = _post_json(
-        url,
-        payload,
-        {
-            "Authorization": "Bearer " + bearer_token(settings, key),
-            "Content-Type": "application/json",
-        },
-        settings.http_timeout,
-    )
+    headers = {
+        "Authorization": "Bearer " + bearer_token(settings, key),
+        "Content-Type": "application/json",
+    }
+    if stream:
+        return _stream_openai(url, payload, headers, settings.http_timeout, on_delta)
+    body = _post_json(url, payload, headers, settings.http_timeout)
     return _parse_openai(body)
 
 
@@ -197,6 +211,153 @@ def _complete_anthropic(messages: list[dict], tools: list[Tool], settings: Setti
         settings.http_timeout,
     )
     return _parse_anthropic(body)
+
+
+def _stream_openai(url: str, payload: dict, headers: dict, timeout: float, on_delta) -> Completion:
+    data = json.dumps(payload).encode("utf-8")
+    host = urlparse(url).netloc or url
+    last_error = None
+    for attempt in range(2):
+        request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return _consume_openai_stream(response, host, on_delta)
+        except ProviderError:
+            raise
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:500]
+            exc.close()
+            last_error = ProviderError(f"HTTP {exc.code} from {host}: {detail}")
+            if exc.code not in _TRANSIENT_HTTP or attempt == 1:
+                raise last_error from None
+        except urllib.error.URLError as exc:
+            raise ProviderError(f"could not reach {host}: {exc.reason}") from None
+        except TimeoutError as exc:
+            raise ProviderError(f"timed out talking to {host}") from exc
+    raise last_error or ProviderError(f"no response from {host}")
+
+
+def _consume_openai_stream(response, host: str, on_delta) -> Completion:
+    buf = ""
+    content_parts: list[str] = []
+    tool_acc: dict[int, dict] = {}
+    saw_tools = False
+    peeked = False
+    while True:
+        chunk = response.read(1024)
+        if not chunk:
+            break
+        buf += chunk.decode("utf-8", errors="replace")
+        if not peeked:
+            peeked = True
+            stripped = buf.lstrip()
+            if stripped.startswith("{") or stripped.startswith("["):
+                rest = response.read().decode("utf-8", errors="replace")
+                text = buf + rest
+                try:
+                    parsed = json.loads(text)
+                except json.JSONDecodeError as exc:
+                    raise ProviderError(f"non-JSON response from {host}") from exc
+                if not isinstance(parsed, dict):
+                    raise ProviderError(f"unexpected response from {host}")
+                return _parse_openai(parsed)
+        while True:
+            split_at = _sse_split(buf)
+            if split_at < 0:
+                break
+            block, buf = buf[:split_at], buf[split_at:]
+            buf = buf.lstrip("\r\n")
+            for data in _sse_block_data(block):
+                if data == "[DONE]":
+                    return _completion_from_stream(content_parts, tool_acc)
+                saw_tools = _apply_sse_event(data, content_parts, tool_acc, on_delta, saw_tools) or saw_tools
+    for data in _sse_block_data(buf):
+        if data == "[DONE]":
+            break
+        saw_tools = _apply_sse_event(data, content_parts, tool_acc, on_delta, saw_tools) or saw_tools
+    return _completion_from_stream(content_parts, tool_acc)
+
+
+def _sse_split(buf: str) -> int:
+    for token in ("\n\n", "\r\n\r\n"):
+        at = buf.find(token)
+        if at >= 0:
+            return at
+    return -1
+
+
+def _sse_block_data(block: str):
+    parts: list[str] = []
+    for line in block.splitlines():
+        if line.startswith("data:"):
+            parts.append(line[5:].lstrip())
+    if parts:
+        yield "\n".join(parts)
+
+
+def _apply_sse_event(data: str, content_parts: list[str], tool_acc: dict, on_delta, saw_tools: bool) -> bool:
+    try:
+        event = json.loads(data)
+    except json.JSONDecodeError:
+        return saw_tools
+    if not isinstance(event, dict):
+        return saw_tools
+    try:
+        choice = event["choices"][0]
+    except (KeyError, IndexError, TypeError):
+        return saw_tools
+    delta = choice.get("delta") or {}
+    if not isinstance(delta, dict):
+        delta = {}
+    piece = delta.get("content")
+    if isinstance(piece, str) and piece:
+        content_parts.append(piece)
+        if on_delta and not saw_tools:
+            on_delta(piece)
+    for raw in delta.get("tool_calls") or []:
+        if not isinstance(raw, dict):
+            continue
+        saw_tools = True
+        index = raw.get("index", 0)
+        try:
+            index = int(index)
+        except (TypeError, ValueError):
+            index = 0
+        slot = tool_acc.setdefault(index, {"id": "", "name": "", "arguments": ""})
+        if raw.get("id"):
+            slot["id"] = str(raw["id"])
+        fn = raw.get("function") or {}
+        if isinstance(fn, dict):
+            if fn.get("name"):
+                slot["name"] = str(fn["name"])
+            if fn.get("arguments"):
+                slot["arguments"] += str(fn["arguments"])
+    return saw_tools
+
+
+def _completion_from_stream(content_parts: list[str], tool_acc: dict) -> Completion:
+    content = "".join(content_parts)
+    raw_calls = []
+    calls = []
+    for index in sorted(tool_acc):
+        slot = tool_acc[index]
+        arguments = slot["arguments"] or "{}"
+        raw_calls.append(
+            {
+                "id": slot["id"] or slot["name"] or "tool",
+                "type": "function",
+                "function": {"name": slot["name"], "arguments": arguments},
+            }
+        )
+        calls.append(
+            ToolCall(
+                id=slot["id"] or slot["name"] or "tool",
+                name=slot["name"],
+                arguments=arguments,
+                parsed=_parse_arguments(arguments),
+            )
+        )
+    return Completion(content=content, tool_calls=calls, raw_tool_calls=raw_calls)
 
 
 def _parse_openai(body: dict) -> Completion:
@@ -277,18 +438,27 @@ def _parse_arguments(arguments: str) -> dict | None:
 
 def _post_json(url: str, payload: dict, headers: dict, timeout: float) -> dict:
     data = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(url, data=data, headers=headers, method="POST")
     host = urlparse(url).netloc or url
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            raw = response.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")[:500]
-        raise ProviderError(f"HTTP {exc.code} from {host}: {detail}") from None
-    except urllib.error.URLError as exc:
-        raise ProviderError(f"could not reach {host}: {exc.reason}") from None
-    except TimeoutError as exc:
-        raise ProviderError(f"timed out talking to {host}") from exc
+    raw = None
+    last_error = None
+    for attempt in range(2):
+        request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+            break
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:500]
+            exc.close()
+            last_error = ProviderError(f"HTTP {exc.code} from {host}: {detail}")
+            if exc.code not in _TRANSIENT_HTTP or attempt == 1:
+                raise last_error from None
+        except urllib.error.URLError as exc:
+            raise ProviderError(f"could not reach {host}: {exc.reason}") from None
+        except TimeoutError as exc:
+            raise ProviderError(f"timed out talking to {host}") from exc
+    if raw is None:
+        raise last_error or ProviderError(f"no response from {host}")
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -343,3 +513,41 @@ def select_lmstudio_model(settings: Settings, catalog: list[dict]) -> str:
         if "tool_use" in caps:
             return item["id"]
     return loaded_ids[0]
+
+
+def fetch_openai_catalog(settings: Settings, key: str | None = None, timeout: float = 15) -> list[dict]:
+    """GET /models from an OpenAI-compatible endpoint. This does not send a chat turn."""
+    url = settings.base_url.rstrip("/") + "/models"
+    request = urllib.request.Request(
+        url,
+        headers={"Authorization": "Bearer " + bearer_token(settings, key)},
+        method="GET",
+    )
+    host = urlparse(url).netloc or url
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:300]
+        raise ProviderError(f"HTTP {exc.code} from {host}: {detail}") from None
+    except urllib.error.URLError as exc:
+        raise ProviderError(f"could not reach {host}: {exc.reason}") from None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ProviderError(f"non-JSON model list from {host}") from exc
+    data = parsed.get("data") if isinstance(parsed, dict) else None
+    if not isinstance(data, list):
+        raise ProviderError(f"model list from {host} had no data array")
+    return [item for item in data if isinstance(item, dict) and item.get("id")]
+
+
+def catalog_ids(catalog: list[dict], preferred: tuple[str, ...] = ()) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item_id in (*preferred, *(str(item.get("id")) for item in catalog)):
+        if not item_id or item_id in seen:
+            continue
+        seen.add(item_id)
+        ordered.append(item_id)
+    return ordered
